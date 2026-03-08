@@ -1,0 +1,13 @@
+# Editor/OS backup files
+*~
+
+# Python virtual environments and bytecode caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Data directories (any path segment starting with "data")
+**/data*/
+
+# Notebooks
+*.ipynb
