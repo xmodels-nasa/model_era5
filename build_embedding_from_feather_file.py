@@ -24,10 +24,34 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+
+def _load_dotenv() -> None:
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            key, value = s.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            if (value.startswith('"') and value.endswith('"')) or (
+                value.startswith("'") and value.endswith("'")
+            ):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
 from build_aurora_batches import get_embeddings_for_target, DATA_ROOT
 
 # configuration defaults
-FEATHER_FILE = "/path/to/your.feather"  # override as needed
+FEATHER_FILE = os.getenv("FEATHER_FILE", "/path/to/your.feather")
 DATA_ROOT_OVERRIDE: Optional[str] = None  # if None, uses build_aurora_batches.DATA_ROOT
 SAMPLE_RATIO = 0.01
 RANDOM_STATE = 42

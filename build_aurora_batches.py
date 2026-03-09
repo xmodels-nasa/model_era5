@@ -9,10 +9,34 @@ import torch
 import xarray as xr
 from aurora import AuroraSmallPretrained, Batch, Metadata
 
+
+def _load_dotenv() -> None:
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            key, value = s.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            if (value.startswith('"') and value.endswith('"')) or (
+                value.startswith("'") and value.endswith("'")
+            ):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
 # =========================
 # Editable config variables
 # =========================
-DATA_ROOT = "/Users/charley/nasa/4dcloud-2026/model_era5/data_era5"
+DATA_ROOT = os.getenv("DATA_ROOT", "/Users/charley/nasa/4dcloud-2026/model_era5/data_era5")
 TARGETS = [
     "2018_10_10_06",
     "2018_10_10_12",
@@ -20,8 +44,10 @@ TARGETS = [
 TIME_INDEX = 0  # Current ERA5 folder layout has one timestamp per file, so keep this at 0.
 SKIP_PREDICT = False
 PREDICT_ALL = False
-AURORA_CHECKPOINT_REPO = "microsoft/aurora"
-AURORA_CHECKPOINT_FILE = "aurora-0.25-small-pretrained.ckpt"
+AURORA_CHECKPOINT_REPO = os.getenv("AURORA_CHECKPOINT_REPO", "microsoft/aurora")
+AURORA_CHECKPOINT_FILE = os.getenv(
+    "AURORA_CHECKPOINT_FILE", "aurora-0.25-small-pretrained.ckpt"
+)
 
 
 def parse_target(ts: str) -> datetime:
