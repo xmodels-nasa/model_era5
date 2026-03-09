@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generate Aurora embeddings for all rows in all Feather files under FEATHER_ROOT.
 
-Outputs one `.npy` file per row containing only `emb_all_levels`, named:
-    <feather_stem>__row_<row_number>.npy
+Outputs one `.npz` file per feather file (same stem), containing:
+    - `emb_all_levels`: stacked embeddings for successful rows
+    - `row_indices`: source row index for each embedding entry
 """
 
 import os
@@ -81,6 +82,8 @@ def process_one_feather_file(feather_file: str, output_dir: str, data_root: str)
 
     rows_written = 0
     rows_failed = 0
+    row_indices: List[int] = []
+    embeddings: List[np.ndarray] = []
     for row_idx, row in df.iterrows():
         try:
             emb = get_embeddings_for_target(
@@ -95,16 +98,32 @@ def process_one_feather_file(feather_file: str, output_dir: str, data_root: str)
                 arr = emb_all_levels.detach().cpu().numpy()
             else:
                 arr = np.asarray(emb_all_levels)
-
-            out_file = Path(output_dir) / f"{stem}__row_{row_idx}.npy"
-            np.save(out_file, arr)
+            embeddings.append(arr)
+            row_indices.append(int(row_idx))
             rows_written += 1
         except Exception as exc:
             rows_failed += 1
             print(f"[ERROR] {path.name} row {row_idx}: {exc}")
 
+    output_file = Path(output_dir) / f"{stem}.npz"
+    if embeddings:
+        # Keep row alignment via `row_indices` for lookup back to feather rows.
+        emb_stacked = np.stack(embeddings, axis=0)
+        np.savez_compressed(
+            output_file,
+            emb_all_levels=emb_stacked,
+            row_indices=np.asarray(row_indices, dtype=np.int64),
+        )
+    else:
+        np.savez_compressed(
+            output_file,
+            emb_all_levels=np.empty((0,), dtype=np.float32),
+            row_indices=np.empty((0,), dtype=np.int64),
+        )
+
     return {
         "file": str(path),
+        "output_file": str(output_file),
         "rows_total": int(len(df)),
         "rows_written": int(rows_written),
         "rows_failed": int(rows_failed),
@@ -139,7 +158,7 @@ def main() -> List[Dict[str, object]]:
             print(
                 f"[DONE] {Path(summary['file']).name}: "
                 f"written={summary['rows_written']}/{summary['rows_total']}, "
-                f"failed={summary['rows_failed']}"
+                f"failed={summary['rows_failed']} | out={Path(summary['output_file']).name}"
             )
 
     total_files = len(summaries)
