@@ -2,7 +2,7 @@
 import dataclasses
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -275,10 +275,10 @@ def token_indices_for_latlon(
     else:
         lon_norm = lon_in
 
-    if lat_norm != lat_in:
-        print(f"Mapped Feather latitude {lat_in} -> ERA5 latitude {lat_norm}")
-    if lon_norm != lon_in:
-        print(f"Mapped Feather longitude {lon_in} -> ERA5 longitude {lon_norm}")
+    #if lat_norm != lat_in:
+    #    print(f"Mapped Feather latitude {lat_in} -> ERA5 latitude {lat_norm}")
+    #if lon_norm != lon_in:
+    #    print(f"Mapped Feather longitude {lon_in} -> ERA5 longitude {lon_norm}")
 
     # Choose nearest gridpoint, not lower-bound bin.
     lat_np = lat_vec.detach().cpu().numpy()
@@ -320,6 +320,94 @@ def embedding_at_latlon(
     return enc_out[:, token_indices[level], :]
 
 
+def _normalize_lon_to_grid(lon: float, lon_vec: np.ndarray) -> float:
+    lon_min = float(lon_vec.min())
+    lon_max = float(lon_vec.max())
+    if lon_min >= 0.0 and lon_max > 180.0:
+        return lon % 360.0
+    if lon_min < 0.0 and lon_max <= 180.0:
+        return ((lon + 180.0) % 360.0) - 180.0
+    return lon
+
+
+def _nearest_lon_on_grid(lon_vec: np.ndarray, lon_norm: float) -> float:
+    lon_span = float(lon_vec.max() - lon_vec.min())
+    if lon_span > 300.0:
+        lon_dist = np.abs(((lon_vec - lon_norm + 180.0) % 360.0) - 180.0)
+    else:
+        lon_dist = np.abs(lon_vec - lon_norm)
+    return float(lon_vec[lon_dist.argmin()])
+
+
+def get_encoder_context_for_target(
+    data_root: str,
+    target: str,
+    time_index: int = 0,
+    model: Optional[AuroraSmallPretrained] = None,
+) -> Dict[str, Any]:
+    """Build one encoder context for a target hour so multiple lat/lon queries can reuse it."""
+    target_dt = parse_target(target)
+    t_minus_6 = target_dt - timedelta(hours=6)
+
+    d0 = resolve_dir(data_root, t_minus_6)
+    d1 = resolve_dir(data_root, target_dt)
+    batch = load_batch_from_two_dirs(d0, d1, time_index=time_index)
+
+    local_model = model if model is not None else load_aurora_model()
+    enc_out, enc_batch = get_encoder_output(local_model, batch)
+    return {
+        "context_time": target_dt,
+        "input_times": (t_minus_6, target_dt),
+        "target": target_dt,
+        "input_pair": (t_minus_6, target_dt),
+        "enc_out": enc_out,
+        "enc_batch": enc_batch,
+        "model": local_model,
+    }
+
+
+def get_embedding_from_encoder_context(
+    encoder_context: Dict[str, Any],
+    lat: float,
+    lon: float,
+) -> Dict[str, object]:
+    """Extract one embedding from a precomputed encoder context at the nearest gridpoint."""
+    enc_out = encoder_context["enc_out"]
+    enc_batch = encoder_context["enc_batch"]
+    local_model = encoder_context["model"]
+
+    patch_idx, token_indices = token_indices_for_latlon(enc_batch, local_model, lat, lon)
+    lat_vec = enc_batch.metadata.lat.detach().cpu().numpy()
+    lon_vec = enc_batch.metadata.lon.detach().cpu().numpy()
+    nearest_lat = float(lat_vec[np.abs(lat_vec - lat).argmin()])
+    lon_norm = _normalize_lon_to_grid(lon, lon_vec)
+    nearest_lon = _nearest_lon_on_grid(lon_vec, lon_norm)
+    emb_all = embedding_at_latlon(
+        enc_out,
+        enc_batch,
+        local_model,
+        lat,
+        lon,
+        level=None,
+        token_indices=token_indices,
+    )
+
+    return {
+        "context_time": encoder_context["context_time"],
+        "input_times": encoder_context["input_times"],
+        "target": encoder_context["target"],
+        "input_pair": encoder_context["input_pair"],
+        "lat": lat,
+        "lon": lon_norm,
+        "matched_lat": nearest_lat,
+        "matched_lon": nearest_lon,
+        "patch_idx": patch_idx,
+        "token_indices": token_indices,
+        "emb_all_levels": emb_all,  # shape: [B, latent_levels, D]
+        "enc_out_shape": tuple(enc_out.shape),
+    }
+
+
 def get_embeddings_for_target(
     data_root: str,
     target: str,
@@ -336,55 +424,17 @@ def get_embeddings_for_target(
     embeddings represent the target context at time t, conditioned on both
     input timestamps.
     """
-    target_dt = parse_target(target)
-    t_minus_6 = target_dt - timedelta(hours=6)
-
-    d0 = resolve_dir(data_root, t_minus_6)
-    d1 = resolve_dir(data_root, target_dt)
-    batch = load_batch_from_two_dirs(d0, d1, time_index=time_index)
-
-    local_model = model if model is not None else load_aurora_model()
-    enc_out, enc_batch = get_encoder_output(local_model, batch)
-    patch_idx, token_indices = token_indices_for_latlon(enc_batch, local_model, lat, lon)
-    lat_vec = enc_batch.metadata.lat.detach().cpu().numpy()
-    lon_vec = enc_batch.metadata.lon.detach().cpu().numpy()
-    nearest_lat = float(lat_vec[np.abs(lat_vec - lat).argmin()])
-    if float(lon_vec.min()) >= 0.0 and float(lon_vec.max()) > 180.0:
-        lon_norm = lon % 360.0
-    elif float(lon_vec.min()) < 0.0 and float(lon_vec.max()) <= 180.0:
-        lon_norm = ((lon + 180.0) % 360.0) - 180.0
-    else:
-        lon_norm = lon
-    lon_span = float(lon_vec.max() - lon_vec.min())
-    if lon_span > 300.0:
-        lon_dist = np.abs(((lon_vec - lon_norm + 180.0) % 360.0) - 180.0)
-    else:
-        lon_dist = np.abs(lon_vec - lon_norm)
-    nearest_lon = float(lon_vec[lon_dist.argmin()])
-    emb_all = embedding_at_latlon(
-        enc_out,
-        enc_batch,
-        local_model,
-        lat,
-        lon,
-        level=None,
-        token_indices=token_indices,
+    encoder_context = get_encoder_context_for_target(
+        data_root=data_root,
+        target=target,
+        time_index=time_index,
+        model=model,
     )
-
-    return {
-        "context_time": target_dt,
-        "input_times": (t_minus_6, target_dt),
-        "target": target_dt,
-        "input_pair": (t_minus_6, target_dt),
-        "lat": lat,
-        "lon": lon_norm,
-        "matched_lat": nearest_lat,
-        "matched_lon": nearest_lon,
-        "patch_idx": patch_idx,
-        "token_indices": token_indices,
-        "emb_all_levels": emb_all,  # shape: [B, latent_levels, D]
-        "enc_out_shape": tuple(enc_out.shape),
-    }
+    return get_embedding_from_encoder_context(
+        encoder_context=encoder_context,
+        lat=lat,
+        lon=lon,
+    )
 
 
 def run_with_config() -> List[Tuple[datetime, Batch]]:
