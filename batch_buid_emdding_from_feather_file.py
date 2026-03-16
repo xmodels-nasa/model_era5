@@ -92,11 +92,18 @@ def process_feather_batched(
     for target in unique_targets:
         group = sampled[sampled["target"] == target]
         print(f"Building shared encoder context for target={target} ({len(group)} row(s))")
-        encoder_context = get_encoder_context_for_target(
-            data_root=root,
-            target=target,
-            model=model,
-        )
+        try:
+            encoder_context = get_encoder_context_for_target(
+                data_root=root,
+                target=target,
+                model=model,
+            )
+        except FileNotFoundError as e:
+            print(
+                f"[WARN] Skipping target={target}: missing ERA5 input for this hour "
+                f"({len(group)} row(s) skipped). Details: {e}"
+            )
+            continue
         for _, row in group.iterrows():
             emb = get_embedding_from_encoder_context(
                 encoder_context=encoder_context,
