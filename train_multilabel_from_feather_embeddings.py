@@ -66,9 +66,11 @@ class MultiLabelMLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, output_dim),
@@ -168,6 +170,8 @@ def load_one_file_samples(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray]:
     emb_flat = emb.reshape(emb.shape[0], -1).astype(np.float32)
     base = df.iloc[rows][BASE_FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=True)
     y = df.iloc[rows][TARGET_COLUMNS].to_numpy(dtype=np.float32, copy=True)
+    # Enforce binary targets for BCEWithLogitsLoss.
+    y = (y > 0.5).astype(np.float32)
     x = np.concatenate([base, emb_flat], axis=1)
     return x, y
 
@@ -186,6 +190,26 @@ def load_dataset(files: Sequence[FileMeta]) -> Tuple[np.ndarray, np.ndarray]:
     return np.concatenate(x_parts, axis=0), np.concatenate(y_parts, axis=0)
 
 
+def _binary_auc_macro(probs: torch.Tensor, targets: torch.Tensor) -> float:
+    aucs: List[float] = []
+    for j in range(targets.shape[1]):
+        y = targets[:, j]
+        s = probs[:, j]
+        pos = int((y == 1).sum().item())
+        neg = int((y == 0).sum().item())
+        if pos == 0 or neg == 0:
+            continue
+        order = torch.argsort(s)
+        ranks = torch.empty_like(order, dtype=torch.float32)
+        ranks[order] = torch.arange(1, len(s) + 1, dtype=torch.float32)
+        rank_sum_pos = ranks[y == 1].sum().item()
+        auc = (rank_sum_pos - (pos * (pos + 1) / 2.0)) / (pos * neg)
+        aucs.append(float(auc))
+    if not aucs:
+        return float("nan")
+    return float(np.mean(aucs))
+
+
 def _binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
     probs = torch.sigmoid(logits)
     preds = (probs >= 0.5).float()
@@ -196,7 +220,8 @@ def _binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, fl
     fn = ((preds == 0) & (targets == 1)).sum(dim=0).float()
     f1_per_label = (2 * tp) / (2 * tp + fp + fn + 1e-8)
     f1_macro = f1_per_label.mean().item()
-    return {"accuracy": float(acc), "f1_macro": float(f1_macro)}
+    auc_macro = _binary_auc_macro(probs, targets)
+    return {"accuracy": float(acc), "f1_macro": float(f1_macro), "auc_macro": float(auc_macro)}
 
 
 def train_model(
@@ -207,6 +232,9 @@ def train_model(
     epochs: int,
     batch_size: int,
     lr: float,
+    weight_decay: float,
+    grad_clip_norm: float,
+    use_pos_weight: bool,
     seed: int,
     device: str,
 ) -> Dict[str, object]:
@@ -229,8 +257,14 @@ def train_model(
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
     model = MultiLabelMLP(input_dim=x_train_t.shape[1], output_dim=y_train_t.shape[1]).to(device)
-    loss_fn = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if use_pos_weight:
+        pos = y_train_t.sum(dim=0)
+        neg = y_train_t.shape[0] - pos
+        pos_weight = (neg / torch.clamp(pos, min=1.0)).clamp(min=1.0, max=20.0).to(device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        loss_fn = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -243,6 +277,8 @@ def train_model(
             logits = model(xb)
             loss = loss_fn(logits, yb)
             loss.backward()
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
             total_loss += float(loss.item()) * xb.shape[0]
             total_count += xb.shape[0]
@@ -259,7 +295,8 @@ def train_model(
         print(
             f"Epoch {epoch:03d} | train_loss={train_loss:.5f} | test_loss={test_loss:.5f} | "
             f"train_acc={train_metrics['accuracy']:.4f} | test_acc={test_metrics['accuracy']:.4f} | "
-            f"train_f1_macro={train_metrics['f1_macro']:.4f} | test_f1_macro={test_metrics['f1_macro']:.4f}"
+            f"train_f1_macro={train_metrics['f1_macro']:.4f} | test_f1_macro={test_metrics['f1_macro']:.4f} | "
+            f"train_auc_macro={train_metrics['auc_macro']:.4f} | test_auc_macro={test_metrics['auc_macro']:.4f}"
         )
 
     return {
@@ -322,7 +359,10 @@ def main() -> int:
     parser.add_argument("--test-files", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--no-pos-weight", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -365,6 +405,9 @@ def main() -> int:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip_norm=args.grad_clip_norm,
+        use_pos_weight=(not args.no_pos_weight),
         seed=args.seed,
         device=args.device,
     )
@@ -374,7 +417,9 @@ def main() -> int:
         f"train_acc={fit['train_metrics']['accuracy']:.4f}, "
         f"test_acc={fit['test_metrics']['accuracy']:.4f}, "
         f"train_f1_macro={fit['train_metrics']['f1_macro']:.4f}, "
-        f"test_f1_macro={fit['test_metrics']['f1_macro']:.4f}"
+        f"test_f1_macro={fit['test_metrics']['f1_macro']:.4f}, "
+        f"train_auc_macro={fit['train_metrics']['auc_macro']:.4f}, "
+        f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}"
     )
 
     _save_artifacts(
