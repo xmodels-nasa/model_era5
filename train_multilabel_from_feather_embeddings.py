@@ -224,6 +224,40 @@ def _binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, fl
     return {"accuracy": float(acc), "f1_macro": float(f1_macro), "auc_macro": float(auc_macro)}
 
 
+def _evaluate_in_batches(
+    model: nn.Module,
+    loss_fn: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    batch_size: int,
+    device: str,
+) -> Tuple[float, Dict[str, float]]:
+    ds = TensorDataset(x, y)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    total_loss = 0.0
+    total_count = 0
+    logits_cpu_parts: List[torch.Tensor] = []
+    targets_cpu_parts: List[torch.Tensor] = []
+
+    model.eval()
+    with torch.no_grad():
+        for xb, yb in dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            total_loss += float(loss.item()) * xb.shape[0]
+            total_count += xb.shape[0]
+            logits_cpu_parts.append(logits.cpu())
+            targets_cpu_parts.append(yb.cpu())
+
+    avg_loss = total_loss / max(total_count, 1)
+    all_logits = torch.cat(logits_cpu_parts, dim=0)
+    all_targets = torch.cat(targets_cpu_parts, dim=0)
+    metrics = _binary_metrics(all_logits, all_targets)
+    return avg_loss, metrics
+
+
 def train_model(
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -231,6 +265,7 @@ def train_model(
     y_test: np.ndarray,
     epochs: int,
     batch_size: int,
+    eval_batch_size: int,
     lr: float,
     weight_decay: float,
     grad_clip_norm: float,
@@ -284,24 +319,26 @@ def train_model(
             total_count += xb.shape[0]
 
         train_loss = total_loss / max(total_count, 1)
-        model.eval()
-        with torch.no_grad():
-            x_train_dev = x_train_t.to(device)
-            y_train_dev = y_train_t.to(device)
-            x_test_dev = x_test_t.to(device)
-            y_test_dev = y_test_t.to(device)
-
-            tr_logits_dev = model(x_train_dev)
-            te_logits_dev = model(x_test_dev)
-            test_loss = float(loss_fn(te_logits_dev, y_test_dev).item())
-
-            tr_logits = tr_logits_dev.cpu()
-            te_logits = te_logits_dev.cpu()
-            train_metrics = _binary_metrics(tr_logits, y_train_t)
-            test_metrics = _binary_metrics(te_logits, y_test_t)
+        train_eval_loss, train_metrics = _evaluate_in_batches(
+            model=model,
+            loss_fn=loss_fn,
+            x=x_train_t,
+            y=y_train_t,
+            batch_size=eval_batch_size,
+            device=device,
+        )
+        test_loss, test_metrics = _evaluate_in_batches(
+            model=model,
+            loss_fn=loss_fn,
+            x=x_test_t,
+            y=y_test_t,
+            batch_size=eval_batch_size,
+            device=device,
+        )
 
         print(
-            f"Epoch {epoch:03d} | train_loss={train_loss:.5f} | test_loss={test_loss:.5f} | "
+            f"Epoch {epoch:03d} | train_loss={train_loss:.5f} | train_eval_loss={train_eval_loss:.5f} | "
+            f"test_loss={test_loss:.5f} | "
             f"train_acc={train_metrics['accuracy']:.4f} | test_acc={test_metrics['accuracy']:.4f} | "
             f"train_f1_macro={train_metrics['f1_macro']:.4f} | test_f1_macro={test_metrics['f1_macro']:.4f} | "
             f"train_auc_macro={train_metrics['auc_macro']:.4f} | test_auc_macro={test_metrics['auc_macro']:.4f}"
@@ -363,10 +400,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--feather-root", type=str, default=FEATHER_ROOT)
     parser.add_argument("--embedding-dir", type=str, default=EMBEDDING_DIR)
-    parser.add_argument("--train-files", type=int, default=20)
-    parser.add_argument("--test-files", type=int, default=5)
+    parser.add_argument("--train-files", type=int, default=100)
+    parser.add_argument("--test-files", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--eval-batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -412,6 +450,7 @@ def main() -> int:
         y_test=y_test,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
