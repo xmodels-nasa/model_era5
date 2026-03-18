@@ -286,11 +286,19 @@ def train_model(
         train_loss = total_loss / max(total_count, 1)
         model.eval()
         with torch.no_grad():
-            tr_logits = model(x_train_t.to(device)).cpu()
-            te_logits = model(x_test_t.to(device)).cpu()
+            x_train_dev = x_train_t.to(device)
+            y_train_dev = y_train_t.to(device)
+            x_test_dev = x_test_t.to(device)
+            y_test_dev = y_test_t.to(device)
+
+            tr_logits_dev = model(x_train_dev)
+            te_logits_dev = model(x_test_dev)
+            test_loss = float(loss_fn(te_logits_dev, y_test_dev).item())
+
+            tr_logits = tr_logits_dev.cpu()
+            te_logits = te_logits_dev.cpu()
             train_metrics = _binary_metrics(tr_logits, y_train_t)
             test_metrics = _binary_metrics(te_logits, y_test_t)
-            test_loss = float(loss_fn(te_logits, y_test_t).item())
 
         print(
             f"Epoch {epoch:03d} | train_loss={train_loss:.5f} | test_loss={test_loss:.5f} | "
