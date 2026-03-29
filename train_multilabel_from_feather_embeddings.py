@@ -210,6 +210,13 @@ def _binary_auc_macro(probs: torch.Tensor, targets: torch.Tensor) -> float:
     return float(np.mean(aucs))
 
 
+def _sample_iou_mean(preds: torch.Tensor, targets: torch.Tensor) -> float:
+    intersection = ((preds == 1) & (targets == 1)).sum(dim=1).float()
+    union = ((preds == 1) | (targets == 1)).sum(dim=1).float()
+    iou_per_sample = torch.where(union > 0, intersection / union, torch.ones_like(union))
+    return float(iou_per_sample.mean().item())
+
+
 def _binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
     probs = torch.sigmoid(logits)
     preds = (probs >= 0.5).float()
@@ -221,7 +228,13 @@ def _binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, fl
     f1_per_label = (2 * tp) / (2 * tp + fp + fn + 1e-8)
     f1_macro = f1_per_label.mean().item()
     auc_macro = _binary_auc_macro(probs, targets)
-    return {"accuracy": float(acc), "f1_macro": float(f1_macro), "auc_macro": float(auc_macro)}
+    iou_mean = _sample_iou_mean(preds, targets)
+    return {
+        "accuracy": float(acc),
+        "f1_macro": float(f1_macro),
+        "auc_macro": float(auc_macro),
+        "iou_mean": float(iou_mean),
+    }
 
 
 def _evaluate_in_batches(
@@ -341,7 +354,8 @@ def train_model(
             f"test_loss={test_loss:.5f} | "
             f"train_acc={train_metrics['accuracy']:.4f} | test_acc={test_metrics['accuracy']:.4f} | "
             f"train_f1_macro={train_metrics['f1_macro']:.4f} | test_f1_macro={test_metrics['f1_macro']:.4f} | "
-            f"train_auc_macro={train_metrics['auc_macro']:.4f} | test_auc_macro={test_metrics['auc_macro']:.4f}"
+            f"train_auc_macro={train_metrics['auc_macro']:.4f} | test_auc_macro={test_metrics['auc_macro']:.4f} | "
+            f"train_iou_mean={train_metrics['iou_mean']:.4f} | test_iou_mean={test_metrics['iou_mean']:.4f}"
         )
 
     return {
@@ -466,7 +480,9 @@ def main() -> int:
         f"train_f1_macro={fit['train_metrics']['f1_macro']:.4f}, "
         f"test_f1_macro={fit['test_metrics']['f1_macro']:.4f}, "
         f"train_auc_macro={fit['train_metrics']['auc_macro']:.4f}, "
-        f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}"
+        f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}, "
+        f"train_iou_mean={fit['train_metrics']['iou_mean']:.4f}, "
+        f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f}"
     )
 
     _save_artifacts(
