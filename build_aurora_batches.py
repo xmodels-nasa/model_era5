@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import xarray as xr
-from aurora import AuroraSmallPretrained, Batch, Metadata
+from aurora import AuroraPretrained, AuroraSmallPretrained, Batch, Metadata
 
 
 def _load_dotenv() -> None:
@@ -33,6 +33,13 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
 # =========================
 # Editable config variables
 # =========================
@@ -44,10 +51,25 @@ TARGETS = [
 TIME_INDEX = 0  # Current ERA5 folder layout has one timestamp per file, so keep this at 0.
 SKIP_PREDICT = False
 PREDICT_ALL = False
+DEBUG = _env_flag("DEBUG", _env_flag("debug", False))
 AURORA_CHECKPOINT_REPO = os.getenv("AURORA_CHECKPOINT_REPO", "microsoft/aurora")
 AURORA_CHECKPOINT_FILE = os.getenv(
-    "AURORA_CHECKPOINT_FILE", "aurora-0.25-small-pretrained.ckpt"
+    "AURORA_CHECKPOINT_FILE", AuroraPretrained.default_checkpoint_name
 )
+AURORA_SMALL_CHECKPOINT_FILE = os.getenv(
+    "AURORA_SMALL_CHECKPOINT_FILE", AuroraSmallPretrained.default_checkpoint_name
+)
+
+
+def _new_aurora_model() -> AuroraPretrained | AuroraSmallPretrained:
+    if DEBUG:
+        model = AuroraSmallPretrained()
+        model.load_checkpoint(AURORA_CHECKPOINT_REPO, AURORA_SMALL_CHECKPOINT_FILE)
+        return model
+
+    model = AuroraPretrained()
+    model.load_checkpoint(AURORA_CHECKPOINT_REPO, AURORA_CHECKPOINT_FILE)
+    return model
 
 
 def parse_target(ts: str) -> datetime:
@@ -185,8 +207,7 @@ def run_prediction_smoke(batches: List[Tuple[datetime, Batch]], predict_all: boo
         print("No batches to run.")
         return
 
-    model = AuroraSmallPretrained()
-    model.load_checkpoint(AURORA_CHECKPOINT_REPO, AURORA_CHECKPOINT_FILE)
+    model = _new_aurora_model()
     model.eval()
 
     run_items = batches if predict_all else [batches[0]]
@@ -199,16 +220,15 @@ def run_prediction_smoke(batches: List[Tuple[datetime, Batch]], predict_all: boo
             )
 
 
-def load_aurora_model(device: Optional[str] = None) -> AuroraSmallPretrained:
-    model = AuroraSmallPretrained()
-    model.load_checkpoint(AURORA_CHECKPOINT_REPO, AURORA_CHECKPOINT_FILE)
+def load_aurora_model(device: Optional[str] = None) -> AuroraPretrained | AuroraSmallPretrained:
+    model = _new_aurora_model()
     if device:
         model = model.to(device)
     model.eval()
     return model
 
 
-def get_encoder_output(model: AuroraSmallPretrained, batch: Batch) -> Tuple[torch.Tensor, Batch]:
+def get_encoder_output(model: AuroraPretrained, batch: Batch) -> Tuple[torch.Tensor, Batch]:
     # Keep the same preprocessing flow used by Aurora forward().
     p = next(model.parameters())
     enc_batch = model.batch_transform_hook(batch).type(p.dtype)
@@ -247,7 +267,7 @@ def get_encoder_output(model: AuroraSmallPretrained, batch: Batch) -> Tuple[torc
 
 
 def token_indices_for_latlon(
-    enc_batch: Batch, model: AuroraSmallPretrained, lat: float, lon: float
+    enc_batch: Batch, model: AuroraPretrained, lat: float, lon: float
 ) -> Tuple[int, List[int]]:
     lat_vec = enc_batch.metadata.lat
     lon_vec = enc_batch.metadata.lon
@@ -307,7 +327,7 @@ def token_indices_for_latlon(
 def embedding_at_latlon(
     enc_out: torch.Tensor,
     enc_batch: Batch,
-    model: AuroraSmallPretrained,
+    model: AuroraPretrained,
     lat: float,
     lon: float,
     level: Optional[int] = None,
@@ -343,7 +363,7 @@ def get_encoder_context_for_target(
     data_root: str,
     target: str,
     time_index: int = 0,
-    model: Optional[AuroraSmallPretrained] = None,
+    model: Optional[AuroraPretrained] = None,
 ) -> Dict[str, Any]:
     """Build one encoder context for a target hour so multiple lat/lon queries can reuse it."""
     target_dt = parse_target(target)
@@ -414,7 +434,7 @@ def get_embeddings_for_target(
     lat: float,
     lon: float,
     time_index: int = 0,
-    model: Optional[AuroraSmallPretrained] = None,
+    model: Optional[AuroraPretrained] = None,
 ) -> Dict[str, object]:
     """
     Build one Aurora input window from (t-6h, t), then return encoder embeddings
