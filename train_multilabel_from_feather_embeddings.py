@@ -61,20 +61,47 @@ class FileMeta:
     file_time: pd.Timestamp
 
 
+def _resolve_hidden_dims(input_dim: int, hidden_dims: Optional[Sequence[int]] = None) -> List[int]:
+    if hidden_dims:
+        dims = [int(d) for d in hidden_dims if int(d) > 0]
+        if dims:
+            return dims
+
+    # Keep the first projection wide enough that larger embeddings are not
+    # immediately squeezed into the old 512-d bottleneck.
+    first = min(2048, max(512, input_dim // 2))
+    second = min(1024, max(256, first // 2))
+    if second >= first:
+        second = max(256, first // 2)
+    return [first, second]
+
+
 class MultiLabelMLP(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int = 40, hidden_dim: int = 512, dropout: float = 0.2):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 40,
+        hidden_dims: Optional[Sequence[int]] = None,
+        dropout: float = 0.2,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, output_dim),
-        )
+        resolved_hidden_dims = _resolve_hidden_dims(input_dim=input_dim, hidden_dims=hidden_dims)
+
+        layers: List[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in resolved_hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.hidden_dims = tuple(resolved_hidden_dims)
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -282,6 +309,8 @@ def train_model(
     lr: float,
     weight_decay: float,
     grad_clip_norm: float,
+    hidden_dims: Optional[Sequence[int]],
+    dropout: float,
     use_pos_weight: bool,
     seed: int,
     device: str,
@@ -304,7 +333,14 @@ def train_model(
     train_ds = TensorDataset(x_train_t, y_train_t)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    model = MultiLabelMLP(input_dim=x_train_t.shape[1], output_dim=y_train_t.shape[1]).to(device)
+    resolved_hidden_dims = _resolve_hidden_dims(input_dim=x_train_t.shape[1], hidden_dims=hidden_dims)
+    model = MultiLabelMLP(
+        input_dim=x_train_t.shape[1],
+        output_dim=y_train_t.shape[1],
+        hidden_dims=resolved_hidden_dims,
+        dropout=dropout,
+    ).to(device)
+    print(f"Classifier hidden dims: {resolved_hidden_dims} | dropout={dropout:.3f}")
     if use_pos_weight:
         pos = y_train_t.sum(dim=0)
         neg = y_train_t.shape[0] - pos
@@ -365,6 +401,8 @@ def train_model(
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
         "input_dim": int(x_train.shape[1]),
+        "hidden_dims": list(resolved_hidden_dims),
+        "dropout": float(dropout),
     }
 
 
@@ -378,6 +416,8 @@ def _save_artifacts(
     train_metrics: Dict[str, float],
     test_metrics: Dict[str, float],
     input_dim: int,
+    hidden_dims: Sequence[int],
+    dropout: float,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model_path = out_dir / "multilabel_mlp.pt"
@@ -389,6 +429,8 @@ def _save_artifacts(
             "model_state_dict": model.state_dict(),
             "input_dim": input_dim,
             "output_dim": 40,
+            "hidden_dims": list(hidden_dims),
+            "dropout": float(dropout),
             "base_features": BASE_FEATURE_COLUMNS,
             "target_columns": TARGET_COLUMNS,
             "train_metrics": train_metrics,
@@ -411,6 +453,12 @@ def _save_artifacts(
 
 
 def main() -> int:
+    def _parse_hidden_dims(value: str) -> List[int]:
+        dims = [int(part.strip()) for part in value.split(",") if part.strip()]
+        if not dims or any(dim <= 0 for dim in dims):
+            raise argparse.ArgumentTypeError("hidden dims must be a comma-separated list of positive integers")
+        return dims
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--feather-root", type=str, default=FEATHER_ROOT)
     parser.add_argument("--embedding-dir", type=str, default=EMBEDDING_DIR)
@@ -422,6 +470,13 @@ def main() -> int:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--hidden-dims",
+        type=_parse_hidden_dims,
+        default=None,
+        help="Comma-separated classifier hidden dims. Default: auto-scale from input_dim, e.g. 1024,512.",
+    )
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--no-pos-weight", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
@@ -468,6 +523,8 @@ def main() -> int:
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
+        hidden_dims=args.hidden_dims,
+        dropout=args.dropout,
         use_pos_weight=(not args.no_pos_weight),
         seed=args.seed,
         device=args.device,
@@ -495,6 +552,8 @@ def main() -> int:
         train_metrics=fit["train_metrics"],
         test_metrics=fit["test_metrics"],
         input_dim=fit["input_dim"],
+        hidden_dims=fit["hidden_dims"],
+        dropout=fit["dropout"],
     )
     return 0
 
