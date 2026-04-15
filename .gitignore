@@ -13,3 +13,6 @@ embeddings/
 
 # Notebooks
 *.ipynb
+
+# Runtime logs
+logs/
