@@ -16,11 +16,15 @@ import numpy as np
 import pandas as pd
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "fine_tuned_model" else SCRIPT_DIR
+
+
 def _load_dotenv() -> None:
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if not os.path.isfile(env_path):
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.is_file():
         return
-    with open(env_path, "r", encoding="utf-8") as f:
+    with env_path.open("r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#") or "=" not in s:
@@ -44,7 +48,7 @@ from batch_buid_emdding_from_feather_file import process_feather_batched
 
 FEATHER_ROOT = os.getenv("FEATHER_ROOT", "")
 EMBEDDING_OUTPUT_DIR = os.getenv(
-    "EMBEDDING_OUTUT_DIR", os.getenv("EMBEDDING_OUTPUT_DIR", str(Path(__file__).with_name("embeddings")))
+    "EMBEDDING_OUTUT_DIR", os.getenv("EMBEDDING_OUTPUT_DIR", str(PROJECT_ROOT / "embeddings"))
 )
 MAX_FILE_WORKERS = 10
 def _safe_stem(path: Path) -> str:

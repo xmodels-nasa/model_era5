@@ -16,11 +16,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "fine_tuned_model" else SCRIPT_DIR
+
+
 def _load_dotenv() -> None:
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if not os.path.isfile(env_path):
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.is_file():
         return
-    with open(env_path, "r", encoding="utf-8") as f:
+    with env_path.open("r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#") or "=" not in s:
@@ -40,8 +44,8 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 FEATHER_ROOT = os.getenv("FEATHER_ROOT", "")
-EMBEDDING_DIR = os.getenv("EMBEDDING_OUTUT_DIR", os.getenv("EMBEDDING_OUTPUT_DIR", "embeddings"))
-OUTPUT_DIR = str(Path(__file__).with_name("model_outputs"))
+EMBEDDING_DIR = os.getenv("EMBEDDING_OUTUT_DIR", os.getenv("EMBEDDING_OUTPUT_DIR", str(PROJECT_ROOT / "embeddings")))
+OUTPUT_DIR = str(PROJECT_ROOT / "model_outputs")
 
 BASE_FEATURE_COLUMNS = [
     "Latitude_0",
@@ -244,7 +248,28 @@ def _sample_iou_mean(preds: torch.Tensor, targets: torch.Tensor) -> float:
     return float(iou_per_sample.mean().item())
 
 
-def _binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
+def _find_best_iou_threshold(
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    num_thresholds: int = 101,
+) -> Tuple[float, float]:
+    best_threshold = 0.5
+    best_iou = float("-inf")
+    for threshold in torch.linspace(0.0, 1.0, steps=num_thresholds):
+        preds = (probs >= threshold).float()
+        iou = _sample_iou_mean(preds, targets)
+        if iou > best_iou:
+            best_iou = iou
+            best_threshold = float(threshold.item())
+    return best_threshold, float(best_iou)
+
+
+def _binary_metrics(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    iou_threshold: Optional[float] = None,
+    search_iou_threshold: bool = False,
+) -> Dict[str, float]:
     probs = torch.sigmoid(logits)
     preds = (probs >= 0.5).float()
     acc = (preds == targets).float().mean().item()
@@ -255,12 +280,18 @@ def _binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, fl
     f1_per_label = (2 * tp) / (2 * tp + fp + fn + 1e-8)
     f1_macro = f1_per_label.mean().item()
     auc_macro = _binary_auc_macro(probs, targets)
-    iou_mean = _sample_iou_mean(preds, targets)
+    if search_iou_threshold:
+        resolved_iou_threshold, iou_mean = _find_best_iou_threshold(probs, targets)
+    else:
+        resolved_iou_threshold = 0.5 if iou_threshold is None else float(iou_threshold)
+        iou_preds = (probs >= resolved_iou_threshold).float()
+        iou_mean = _sample_iou_mean(iou_preds, targets)
     return {
         "accuracy": float(acc),
         "f1_macro": float(f1_macro),
         "auc_macro": float(auc_macro),
         "iou_mean": float(iou_mean),
+        "iou_threshold": float(resolved_iou_threshold),
     }
 
 
@@ -271,6 +302,8 @@ def _evaluate_in_batches(
     y: torch.Tensor,
     batch_size: int,
     device: str,
+    iou_threshold: Optional[float] = None,
+    search_iou_threshold: bool = False,
 ) -> Tuple[float, Dict[str, float]]:
     ds = TensorDataset(x, y)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
@@ -294,7 +327,12 @@ def _evaluate_in_batches(
     avg_loss = total_loss / max(total_count, 1)
     all_logits = torch.cat(logits_cpu_parts, dim=0)
     all_targets = torch.cat(targets_cpu_parts, dim=0)
-    metrics = _binary_metrics(all_logits, all_targets)
+    metrics = _binary_metrics(
+        all_logits,
+        all_targets,
+        iou_threshold=iou_threshold,
+        search_iou_threshold=search_iou_threshold,
+    )
     return avg_loss, metrics
 
 
@@ -375,6 +413,7 @@ def train_model(
             y=y_train_t,
             batch_size=eval_batch_size,
             device=device,
+            search_iou_threshold=True,
         )
         test_loss, test_metrics = _evaluate_in_batches(
             model=model,
@@ -383,6 +422,7 @@ def train_model(
             y=y_test_t,
             batch_size=eval_batch_size,
             device=device,
+            iou_threshold=train_metrics["iou_threshold"],
         )
 
         print(
@@ -391,7 +431,8 @@ def train_model(
             f"train_acc={train_metrics['accuracy']:.4f} | test_acc={test_metrics['accuracy']:.4f} | "
             f"train_f1_macro={train_metrics['f1_macro']:.4f} | test_f1_macro={test_metrics['f1_macro']:.4f} | "
             f"train_auc_macro={train_metrics['auc_macro']:.4f} | test_auc_macro={test_metrics['auc_macro']:.4f} | "
-            f"train_iou_mean={train_metrics['iou_mean']:.4f} | test_iou_mean={test_metrics['iou_mean']:.4f}"
+            f"train_iou_mean={train_metrics['iou_mean']:.4f} @thr={train_metrics['iou_threshold']:.3f} | "
+            f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f}"
         )
 
     return {
@@ -538,8 +579,8 @@ def main() -> int:
         f"test_f1_macro={fit['test_metrics']['f1_macro']:.4f}, "
         f"train_auc_macro={fit['train_metrics']['auc_macro']:.4f}, "
         f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}, "
-        f"train_iou_mean={fit['train_metrics']['iou_mean']:.4f}, "
-        f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f}"
+        f"train_iou_mean={fit['train_metrics']['iou_mean']:.4f} @thr={fit['train_metrics']['iou_threshold']:.3f}, "
+        f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f} @thr={fit['test_metrics']['iou_threshold']:.3f}"
     )
 
     _save_artifacts(

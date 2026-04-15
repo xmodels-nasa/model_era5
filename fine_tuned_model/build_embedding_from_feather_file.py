@@ -18,6 +18,7 @@ file alongside the metadata.
 """
 
 import os
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -25,11 +26,15 @@ import pandas as pd
 import xarray as xr
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "fine_tuned_model" else SCRIPT_DIR
+
+
 def _load_dotenv() -> None:
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if not os.path.isfile(env_path):
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.is_file():
         return
-    with open(env_path, "r", encoding="utf-8") as f:
+    with env_path.open("r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#") or "=" not in s:
