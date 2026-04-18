@@ -15,6 +15,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "fine_tuned_model" else SCRIPT_DIR
@@ -46,6 +51,7 @@ _load_dotenv()
 FEATHER_ROOT = os.getenv("FEATHER_ROOT", "")
 EMBEDDING_DIR = os.getenv("EMBEDDING_OUTUT_DIR", os.getenv("EMBEDDING_OUTPUT_DIR", str(PROJECT_ROOT / "embeddings")))
 OUTPUT_DIR = str(PROJECT_ROOT / "model_outputs")
+LOG_DIR = str(PROJECT_ROOT / "logs")
 
 BASE_FEATURE_COLUMNS = [
     "Latitude_0",
@@ -241,11 +247,14 @@ def _binary_auc_macro(probs: torch.Tensor, targets: torch.Tensor) -> float:
     return float(np.mean(aucs))
 
 
-def _sample_iou_mean(preds: torch.Tensor, targets: torch.Tensor) -> float:
+def _sample_iou_values(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     intersection = ((preds == 1) & (targets == 1)).sum(dim=1).float()
     union = ((preds == 1) | (targets == 1)).sum(dim=1).float()
-    iou_per_sample = torch.where(union > 0, intersection / union, torch.ones_like(union))
-    return float(iou_per_sample.mean().item())
+    return torch.where(union > 0, intersection / union, torch.ones_like(union))
+
+
+def _sample_iou_mean(preds: torch.Tensor, targets: torch.Tensor) -> float:
+    return float(_sample_iou_values(preds, targets).mean().item())
 
 
 def _find_best_iou_threshold(
@@ -304,7 +313,8 @@ def _evaluate_in_batches(
     device: str,
     iou_threshold: Optional[float] = None,
     search_iou_threshold: bool = False,
-) -> Tuple[float, Dict[str, float]]:
+    collect_details: bool = False,
+) -> Tuple[float, Dict[str, float], Optional[Dict[str, torch.Tensor]]]:
     ds = TensorDataset(x, y)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
     total_loss = 0.0
@@ -333,7 +343,107 @@ def _evaluate_in_batches(
         iou_threshold=iou_threshold,
         search_iou_threshold=search_iou_threshold,
     )
-    return avg_loss, metrics
+    details: Optional[Dict[str, torch.Tensor]] = None
+    if collect_details:
+        probs = torch.sigmoid(all_logits)
+        preds = (probs >= metrics["iou_threshold"]).float()
+        details = {
+            "probs": probs,
+            "targets": all_targets,
+            "preds": preds,
+            "sample_ious": _sample_iou_values(preds, all_targets),
+        }
+    return avg_loss, metrics, details
+
+
+def _save_random_iou_plots(
+    out_dir: Path,
+    split_name: str,
+    eval_details: Optional[Dict[str, torch.Tensor]],
+    iou_threshold: float,
+    num_random_plots: int,
+    seed: int,
+) -> None:
+    if num_random_plots <= 0:
+        print(f"Skipping {split_name} IoU plots because --plot-random-iou-count={num_random_plots}.")
+        return
+    if plt is None:
+        print("Skipping IoU plots because matplotlib is not installed.")
+        return
+    if not eval_details:
+        print(f"Skipping {split_name} IoU plots because evaluation details were not collected.")
+        return
+
+    probs = eval_details["probs"].cpu().numpy()
+    targets = eval_details["targets"].cpu().numpy()
+    preds = eval_details["preds"].cpu().numpy()
+    sample_ious = eval_details["sample_ious"].cpu().numpy()
+    if len(sample_ious) == 0:
+        print(f"Skipping {split_name} IoU plots because the split is empty.")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    chosen_count = min(num_random_plots, len(sample_ious))
+    chosen_indices = rng.choice(len(sample_ious), size=chosen_count, replace=False)
+    label_ids = np.arange(targets.shape[1])
+
+    hist_path = out_dir / f"{split_name}_iou_hist.png"
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    bins = min(30, max(8, int(np.sqrt(len(sample_ious)) * 2)))
+    ax.hist(sample_ious, bins=bins, color="#4C78A8", edgecolor="white")
+    ax.axvline(sample_ious.mean(), color="#F58518", linestyle="--", linewidth=2, label=f"mean={sample_ious.mean():.3f}")
+    ax.set_title(f"{split_name.title()} Sample IoU Distribution")
+    ax.set_xlabel("IoU")
+    ax.set_ylabel("Samples")
+    ax.set_xlim(0.0, 1.0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(hist_path, dpi=160)
+    plt.close(fig)
+    print(f"Saved IoU histogram: {hist_path}")
+
+    for rank, sample_idx in enumerate(chosen_indices, start=1):
+        sample_path = out_dir / f"{split_name}_iou_sample_{rank:02d}_idx_{int(sample_idx):06d}.png"
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(14, 6),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1]},
+        )
+
+        axes[0].bar(label_ids, probs[sample_idx], color="#4C78A8", width=0.9)
+        true_positive_labels = label_ids[targets[sample_idx] > 0.5]
+        if len(true_positive_labels) > 0:
+            axes[0].scatter(
+                true_positive_labels,
+                np.full_like(true_positive_labels, 1.04, dtype=np.float32),
+                marker="v",
+                color="#E45756",
+                s=45,
+                label="target=1",
+            )
+            axes[0].legend(loc="upper right")
+        axes[0].axhline(iou_threshold, color="#72B7B2", linestyle="--", linewidth=2)
+        axes[0].set_ylim(0.0, 1.1)
+        axes[0].set_ylabel("Predicted prob")
+        axes[0].set_title(
+            f"{split_name.title()} sample {int(sample_idx)} | IoU={sample_ious[sample_idx]:.3f} | "
+            f"target_pos={int(targets[sample_idx].sum())} | pred_pos={int(preds[sample_idx].sum())} | "
+            f"thr={iou_threshold:.3f}"
+        )
+
+        comparison = np.vstack([targets[sample_idx], preds[sample_idx]])
+        axes[1].imshow(comparison, aspect="auto", cmap="Blues", vmin=0.0, vmax=1.0)
+        axes[1].set_yticks([0, 1], labels=["target", "pred"])
+        axes[1].set_xlabel("Label index")
+        axes[1].set_ylabel("Binary")
+
+        fig.tight_layout()
+        fig.savefig(sample_path, dpi=160)
+        plt.close(fig)
+        print(f"Saved random IoU sample plot: {sample_path}")
 
 
 def train_model(
@@ -352,7 +462,12 @@ def train_model(
     use_pos_weight: bool,
     seed: int,
     device: str,
+    plot_random_iou_count: int,
+    plot_dir: Path,
 ) -> Dict[str, object]:
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -387,6 +502,7 @@ def train_model(
     else:
         loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    test_eval_details: Optional[Dict[str, torch.Tensor]] = None
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -406,7 +522,7 @@ def train_model(
             total_count += xb.shape[0]
 
         train_loss = total_loss / max(total_count, 1)
-        train_eval_loss, train_metrics = _evaluate_in_batches(
+        train_eval_loss, train_metrics, _ = _evaluate_in_batches(
             model=model,
             loss_fn=loss_fn,
             x=x_train_t,
@@ -415,7 +531,7 @@ def train_model(
             device=device,
             search_iou_threshold=True,
         )
-        test_loss, test_metrics = _evaluate_in_batches(
+        test_loss, test_metrics, test_eval_details = _evaluate_in_batches(
             model=model,
             loss_fn=loss_fn,
             x=x_test_t,
@@ -423,6 +539,7 @@ def train_model(
             batch_size=eval_batch_size,
             device=device,
             iou_threshold=train_metrics["iou_threshold"],
+            collect_details=(epoch == epochs),
         )
 
         print(
@@ -435,12 +552,22 @@ def train_model(
             f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f}"
         )
 
+    _save_random_iou_plots(
+        out_dir=plot_dir,
+        split_name="validation",
+        eval_details=test_eval_details,
+        iou_threshold=test_metrics["iou_threshold"],
+        num_random_plots=plot_random_iou_count,
+        seed=seed,
+    )
+
     return {
         "model": model,
         "x_mean": x_mean.astype(np.float32),
         "x_std": x_std.astype(np.float32),
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
+        "test_eval_details": test_eval_details,
         "input_dim": int(x_train.shape[1]),
         "hidden_dims": list(resolved_hidden_dims),
         "dropout": float(dropout),
@@ -521,6 +648,13 @@ def main() -> int:
     parser.add_argument("--no-pos-weight", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
+    parser.add_argument("--plot-dir", type=str, default=LOG_DIR)
+    parser.add_argument(
+        "--plot-random-iou-count",
+        type=int,
+        default=6,
+        help="Number of random validation/test samples to save as IoU plots in --plot-dir. Set 0 to disable.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -569,6 +703,8 @@ def main() -> int:
         use_pos_weight=(not args.no_pos_weight),
         seed=args.seed,
         device=args.device,
+        plot_random_iou_count=args.plot_random_iou_count,
+        plot_dir=Path(args.plot_dir),
     )
 
     print(
