@@ -51,6 +51,7 @@ _load_dotenv()
 RAW_CHIPS_DIR = os.getenv("RAW_CHIPS_DIR", str(PROJECT_ROOT / "raw_chips"))
 OUTPUT_DIR = str(PROJECT_ROOT / "baseline_model_outputs")
 LOG_DIR = str(PROJECT_ROOT / "logs")
+DEFAULT_TEST_START_TIME = "2019-07-01T00:00:00Z"
 BASE_FEATURE_COLUMNS = [
     "Latitude_0",
     "Longitude_0",
@@ -102,6 +103,15 @@ def _file_time(feather_path: Path) -> Optional[pd.Timestamp]:
     return pd.Timestamp(ts.max())
 
 
+def _parse_utc_timestamp(value: str) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
 def discover_files(raw_chip_dir: Path) -> List[FileMeta]:
     metas: List[FileMeta] = []
     skipped_missing_source = 0
@@ -127,7 +137,11 @@ def discover_files(raw_chip_dir: Path) -> List[FileMeta]:
 
 
 def select_train_test_files(
-    metas: Sequence[FileMeta], train_files: int, test_files: int, seed: int
+    metas: Sequence[FileMeta],
+    train_files: int,
+    test_files: int,
+    seed: int,
+    test_start_time: pd.Timestamp,
 ) -> Tuple[List[FileMeta], List[FileMeta]]:
     if len(metas) < (train_files + test_files):
         raise ValueError(
@@ -135,20 +149,26 @@ def select_train_test_files(
         )
 
     rng = random.Random(seed)
-    sorted_metas = sorted(metas, key=lambda x: x.file_time)
-    late_pool_size = min(len(sorted_metas), max(test_files * 3, test_files))
-    late_pool = sorted_metas[-late_pool_size:]
-    test_selected = rng.sample(late_pool, k=test_files)
-    test_min_time = min(m.file_time for m in test_selected)
+    sorted_metas = sorted(metas, key=lambda x: (x.file_time, str(x.source_file), str(x.npz_path)))
+    test_pool = [m for m in sorted_metas if m.file_time >= test_start_time]
+    if len(test_pool) < test_files:
+        raise ValueError(
+            f"Not enough test files on or after {test_start_time}. "
+            f"Need {test_files}, but only found {len(test_pool)}."
+        )
+    test_selected = rng.sample(test_pool, k=test_files)
 
-    train_pool = [m for m in sorted_metas if m.file_time < test_min_time]
+    train_pool = [m for m in sorted_metas if m.file_time < test_start_time]
     if len(train_pool) < train_files:
         raise ValueError(
             f"Not enough earlier files for training. "
-            f"Need {train_files}, but only {len(train_pool)} files are earlier than test_min_time={test_min_time}."
+            f"Need {train_files}, but only {len(train_pool)} files are earlier than test_start_time={test_start_time}."
         )
     train_selected = rng.sample(train_pool, k=train_files)
-    return train_selected, sorted(test_selected, key=lambda x: x.file_time)
+    return (
+        sorted(train_selected, key=lambda x: (x.file_time, str(x.source_file), str(x.npz_path))),
+        sorted(test_selected, key=lambda x: (x.file_time, str(x.source_file), str(x.npz_path))),
+    )
 
 
 def _timestamps_to_base_features(
@@ -888,6 +908,12 @@ def main() -> int:
     parser.add_argument("--no-pos-weight", action="store_true")
     parser.add_argument("--no-base-features", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--test-start-time",
+        type=str,
+        default=DEFAULT_TEST_START_TIME,
+        help="UTC timestamp cutoff for test-file eligibility. Files on or after this time are eligible for test.",
+    )
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--plot-dir", type=str, default=LOG_DIR)
     parser.add_argument(
@@ -904,14 +930,17 @@ def main() -> int:
         raise FileNotFoundError(f"Raw chip dir does not exist: {raw_chip_dir}")
 
     metas = discover_files(raw_chip_dir)
+    test_start_time = _parse_utc_timestamp(args.test_start_time)
     train_files, test_files = select_train_test_files(
         metas=metas,
         train_files=args.train_files,
         test_files=args.test_files,
         seed=args.seed,
+        test_start_time=test_start_time,
     )
     print(f"Selected train files: {len(train_files)}")
     print(f"Selected test files: {len(test_files)}")
+    print(f"Test file cutoff:   {test_start_time}")
     print(f"Train max file_time: {max(m.file_time for m in train_files)}")
     print(f"Test min file_time:  {min(m.file_time for m in test_files)}")
 
