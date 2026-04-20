@@ -903,7 +903,7 @@ def main() -> int:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--sample-ratio", type=float, default=0.1)
+    parser.add_argument("--sample-ratio", type=float, default=0.3)
     parser.add_argument("--max-samples-per-file", type=int, default=0)
     parser.add_argument("--no-pos-weight", action="store_true")
     parser.add_argument("--no-base-features", action="store_true")
