@@ -200,7 +200,7 @@ def select_train_test_files(
     )
 
 
-def load_one_file_samples(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray]:
+def _load_one_file_arrays(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     required_cols = ["timestamp_0"] + BASE_FEATURE_COLUMNS + TARGET_COLUMNS
     df = pd.read_feather(meta.feather_path)
     missing = [c for c in required_cols if c not in df.columns]
@@ -214,7 +214,8 @@ def load_one_file_samples(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray]:
         rows = data["row_indices"]
 
     if emb.size == 0 or rows.size == 0:
-        return np.empty((0, 0), dtype=np.float32), np.empty((0, 40), dtype=np.float32)
+        empty = np.empty((0, 0), dtype=np.float32)
+        return empty, np.empty((0, 40), dtype=np.float32), np.empty((0,), dtype=np.int64)
 
     rows = rows.astype(np.int64)
     valid = (rows >= 0) & (rows < len(df))
@@ -222,7 +223,8 @@ def load_one_file_samples(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray]:
         rows = rows[valid]
         emb = emb[valid]
     if rows.size == 0:
-        return np.empty((0, 0), dtype=np.float32), np.empty((0, 40), dtype=np.float32)
+        empty = np.empty((0, 0), dtype=np.float32)
+        return empty, np.empty((0, 40), dtype=np.float32), np.empty((0,), dtype=np.int64)
 
     emb_flat = emb.reshape(emb.shape[0], -1).astype(np.float32)
     base = df.iloc[rows][BASE_FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=True)
@@ -230,6 +232,11 @@ def load_one_file_samples(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray]:
     # Enforce binary targets for BCEWithLogitsLoss.
     y = (y > 0.5).astype(np.float32)
     x = np.concatenate([base, emb_flat], axis=1)
+    return x, y, rows
+
+
+def load_one_file_samples(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray]:
+    x, y, _ = _load_one_file_arrays(meta)
     return x, y
 
 
@@ -376,94 +383,146 @@ def _evaluate_in_batches(
     return avg_loss, metrics, details
 
 
-def _save_random_iou_plots(
+def _choose_contiguous_window(
+    row_indices: np.ndarray,
+    window_size: int,
+    rng: np.random.Generator,
+) -> Optional[Tuple[int, int]]:
+    if window_size <= 0 or row_indices.size < window_size:
+        return None
+
+    window_spans: List[Tuple[int, int]] = []
+    run_start = 0
+    for idx in range(1, row_indices.size + 1):
+        is_break = idx == row_indices.size or row_indices[idx] != row_indices[idx - 1] + 1
+        if not is_break:
+            continue
+        for start in range(run_start, idx - window_size + 1):
+            window_spans.append((start, start + window_size))
+        run_start = idx
+
+    if not window_spans:
+        return None
+    return window_spans[int(rng.integers(len(window_spans)))]
+
+
+def _predict_masks_for_file(
+    model: nn.Module,
+    meta: FileMeta,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    eval_batch_size: int,
+    device: str,
+    pred_threshold: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x, y, row_indices = _load_one_file_arrays(meta)
+    if y.shape[0] == 0:
+        empty_masks = np.empty((0, len(TARGET_COLUMNS)), dtype=np.float32)
+        return np.empty((0,), dtype=np.int64), empty_masks, empty_masks
+
+    order = np.argsort(row_indices)
+    row_indices = row_indices[order]
+    x = x[order]
+    y = y[order]
+    x_n = (x - x_mean) / x_std
+    pred_parts: List[np.ndarray] = []
+
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, x_n.shape[0], eval_batch_size):
+            stop = min(start + eval_batch_size, x_n.shape[0])
+            xb = torch.from_numpy(x_n[start:stop].astype(np.float32, copy=False)).to(device)
+            logits = model(xb)
+            preds = (torch.sigmoid(logits) >= pred_threshold).float().cpu().numpy()
+            pred_parts.append(preds.astype(np.float32, copy=False))
+
+    return row_indices, y.astype(np.float32, copy=False), np.concatenate(pred_parts, axis=0)
+
+
+def _save_random_curtain_plots(
     out_dir: Path,
     split_name: str,
-    eval_details: Optional[Dict[str, torch.Tensor]],
-    iou_threshold: float,
+    model: nn.Module,
+    files: Sequence[FileMeta],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    eval_batch_size: int,
+    device: str,
+    pred_threshold: float,
     num_random_plots: int,
+    curtain_rows: int,
     seed: int,
 ) -> None:
     if num_random_plots <= 0:
-        print(f"Skipping {split_name} IoU plots because --plot-random-iou-count={num_random_plots}.")
+        print(f"Skipping {split_name} curtain plots because plot count={num_random_plots}.")
         return
     if plt is None:
-        print("Skipping IoU plots because matplotlib is not installed.")
+        print("Skipping curtain plots because matplotlib is not installed.")
         return
-    if not eval_details:
-        print(f"Skipping {split_name} IoU plots because evaluation details were not collected.")
+    if curtain_rows <= 0:
+        print(f"Skipping {split_name} curtain plots because curtain_rows={curtain_rows}.")
         return
-
-    probs = eval_details["probs"].cpu().numpy()
-    targets = eval_details["targets"].cpu().numpy()
-    preds = eval_details["preds"].cpu().numpy()
-    sample_ious = eval_details["sample_ious"].cpu().numpy()
-    if len(sample_ious) == 0:
-        print(f"Skipping {split_name} IoU plots because the split is empty.")
+    if not files:
+        print(f"Skipping {split_name} curtain plots because the split is empty.")
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    chosen_count = min(num_random_plots, len(sample_ious))
-    chosen_indices = rng.choice(len(sample_ious), size=chosen_count, replace=False)
-    label_ids = np.arange(targets.shape[1])
-
-    hist_path = out_dir / f"{split_name}_iou_hist.png"
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    bins = min(30, max(8, int(np.sqrt(len(sample_ious)) * 2)))
-    ax.hist(sample_ious, bins=bins, color="#4C78A8", edgecolor="white")
-    ax.axvline(sample_ious.mean(), color="#F58518", linestyle="--", linewidth=2, label=f"mean={sample_ious.mean():.3f}")
-    ax.set_title(f"{split_name.title()} Sample IoU Distribution")
-    ax.set_xlabel("IoU")
-    ax.set_ylabel("Samples")
-    ax.set_xlim(0.0, 1.0)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(hist_path, dpi=160)
-    plt.close(fig)
-    print(f"Saved IoU histogram: {hist_path}")
-
-    for rank, sample_idx in enumerate(chosen_indices, start=1):
-        sample_path = out_dir / f"{split_name}_iou_sample_{rank:02d}_idx_{int(sample_idx):06d}.png"
-        fig, axes = plt.subplots(
-            2,
-            1,
-            figsize=(14, 6),
-            sharex=True,
-            gridspec_kw={"height_ratios": [3, 1]},
+    saved = 0
+    for file_idx in rng.permutation(len(files)):
+        if saved >= num_random_plots:
+            break
+        meta = files[int(file_idx)]
+        row_indices, targets, preds = _predict_masks_for_file(
+            model=model,
+            meta=meta,
+            x_mean=x_mean,
+            x_std=x_std,
+            eval_batch_size=eval_batch_size,
+            device=device,
+            pred_threshold=pred_threshold,
         )
+        window = _choose_contiguous_window(row_indices=row_indices, window_size=curtain_rows, rng=rng)
+        if window is None:
+            continue
 
-        axes[0].bar(label_ids, probs[sample_idx], color="#4C78A8", width=0.9)
-        true_positive_labels = label_ids[targets[sample_idx] > 0.5]
-        if len(true_positive_labels) > 0:
-            axes[0].scatter(
-                true_positive_labels,
-                np.full_like(true_positive_labels, 1.04, dtype=np.float32),
-                marker="v",
-                color="#E45756",
-                s=45,
-                label="target=1",
-            )
-            axes[0].legend(loc="upper right")
-        axes[0].axhline(iou_threshold, color="#72B7B2", linestyle="--", linewidth=2)
-        axes[0].set_ylim(0.0, 1.1)
-        axes[0].set_ylabel("Predicted prob")
-        axes[0].set_title(
-            f"{split_name.title()} sample {int(sample_idx)} | IoU={sample_ious[sample_idx]:.3f} | "
-            f"target_pos={int(targets[sample_idx].sum())} | pred_pos={int(preds[sample_idx].sum())} | "
-            f"thr={iou_threshold:.3f}"
+        start, stop = window
+        row_window = row_indices[start:stop]
+        sample_path = out_dir / (
+            f"{split_name}_curtain_{saved + 1:02d}_{_safe_stem(meta.feather_path)}"
+            f"_rows_{int(row_window[0]):06d}_{int(row_window[-1]):06d}.png"
         )
-
-        comparison = np.vstack([targets[sample_idx], preds[sample_idx]])
-        axes[1].imshow(comparison, aspect="auto", cmap="Blues", vmin=0.0, vmax=1.0)
-        axes[1].set_yticks([0, 1], labels=["target", "pred"])
-        axes[1].set_xlabel("Label index")
-        axes[1].set_ylabel("Binary")
-
-        fig.tight_layout()
+        fig, axes = plt.subplots(1, 2, figsize=(14, 8), sharey=True)
+        for ax, image, title in zip(
+            axes,
+            (targets[start:stop], preds[start:stop]),
+            ("Ground Truth", "Prediction"),
+        ):
+            ax.imshow(image, aspect="auto", cmap="gray_r", vmin=0.0, vmax=1.0, interpolation="nearest")
+            ax.set_title(title)
+            ax.set_xlabel("Cloud mask column")
+        axes[0].set_ylabel("Feather row index")
+        y_ticks = np.linspace(0, curtain_rows - 1, num=min(5, curtain_rows), dtype=int)
+        axes[0].set_yticks(y_ticks, labels=[str(int(row_window[idx])) for idx in y_ticks])
+        axes[1].tick_params(axis="y", labelleft=False)
+        fig.suptitle(
+            f"{split_name.title()} cloud-mask curtain | {meta.feather_path.name} | "
+            f"rows {int(row_window[0])}-{int(row_window[-1])}",
+            fontsize=13,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
         fig.savefig(sample_path, dpi=160)
         plt.close(fig)
-        print(f"Saved random IoU sample plot: {sample_path}")
+        saved += 1
+        print(f"Saved curtain plot: {sample_path}")
+
+    if saved == 0:
+        print(
+            f"Skipping {split_name} curtain plots because no test file had a contiguous "
+            f"{curtain_rows}-row span available."
+        )
+    elif saved < num_random_plots:
+        print(f"Saved {saved} {split_name} curtain plot(s); requested {num_random_plots}.")
 
 
 def train_model(
@@ -471,6 +530,7 @@ def train_model(
     y_train: np.ndarray,
     x_test: np.ndarray,
     y_test: np.ndarray,
+    test_files: Sequence[FileMeta],
     epochs: int,
     batch_size: int,
     eval_batch_size: int,
@@ -482,7 +542,8 @@ def train_model(
     use_pos_weight: bool,
     seed: int,
     device: str,
-    plot_random_iou_count: int,
+    plot_random_curtain_count: int,
+    plot_curtain_rows: int,
     plot_dir: Path,
 ) -> Dict[str, object]:
     if epochs < 1:
@@ -522,8 +583,6 @@ def train_model(
     else:
         loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    test_eval_details: Optional[Dict[str, torch.Tensor]] = None
-
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
@@ -551,7 +610,7 @@ def train_model(
             device=device,
             search_iou_threshold=True,
         )
-        test_loss, test_metrics, test_eval_details = _evaluate_in_batches(
+        test_loss, test_metrics, _ = _evaluate_in_batches(
             model=model,
             loss_fn=loss_fn,
             x=x_test_t,
@@ -559,7 +618,6 @@ def train_model(
             batch_size=eval_batch_size,
             device=device,
             iou_threshold=train_metrics["iou_threshold"],
-            collect_details=(epoch == epochs),
         )
 
         print(
@@ -572,12 +630,18 @@ def train_model(
             f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f}"
         )
 
-    _save_random_iou_plots(
+    _save_random_curtain_plots(
         out_dir=plot_dir,
         split_name="validation",
-        eval_details=test_eval_details,
-        iou_threshold=test_metrics["iou_threshold"],
-        num_random_plots=plot_random_iou_count,
+        model=model,
+        files=test_files,
+        x_mean=x_mean,
+        x_std=x_std,
+        eval_batch_size=eval_batch_size,
+        device=device,
+        pred_threshold=test_metrics["iou_threshold"],
+        num_random_plots=plot_random_curtain_count,
+        curtain_rows=plot_curtain_rows,
         seed=seed,
     )
 
@@ -587,7 +651,6 @@ def train_model(
         "x_std": x_std.astype(np.float32),
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
-        "test_eval_details": test_eval_details,
         "input_dim": int(x_train.shape[1]),
         "hidden_dims": list(resolved_hidden_dims),
         "dropout": float(dropout),
@@ -676,10 +739,18 @@ def main() -> int:
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--plot-dir", type=str, default=LOG_DIR)
     parser.add_argument(
+        "--plot-random-curtain-count",
         "--plot-random-iou-count",
+        dest="plot_random_curtain_count",
         type=int,
         default=6,
-        help="Number of random validation/test samples to save as IoU plots in --plot-dir. Set 0 to disable.",
+        help="Number of random validation curtain plots to save in --plot-dir. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--plot-curtain-rows",
+        type=int,
+        default=100,
+        help="Number of contiguous feather rows to show in each validation curtain plot.",
     )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -721,6 +792,7 @@ def main() -> int:
         y_train=y_train,
         x_test=x_test,
         y_test=y_test,
+        test_files=test_files,
         epochs=args.epochs,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
@@ -732,7 +804,8 @@ def main() -> int:
         use_pos_weight=(not args.no_pos_weight),
         seed=args.seed,
         device=args.device,
-        plot_random_iou_count=args.plot_random_iou_count,
+        plot_random_curtain_count=args.plot_random_curtain_count,
+        plot_curtain_rows=args.plot_curtain_rows,
         plot_dir=Path(args.plot_dir),
     )
 
