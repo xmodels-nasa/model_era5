@@ -627,7 +627,6 @@ def _predict_masks_for_file(
     use_base_features: bool,
     eval_batch_size: int,
     device: str,
-    pred_threshold: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     payload = _load_npz_payload(
         meta=meta,
@@ -656,8 +655,8 @@ def _predict_masks_for_file(
                 use_base_features=use_base_features,
             )
             logits = model(chips_t.to(device), base_t.to(device))
-            preds = (torch.sigmoid(logits) >= pred_threshold).float().cpu().numpy()
-            pred_parts.append(preds.astype(np.float32, copy=False))
+            probs = torch.sigmoid(logits).cpu().numpy()
+            pred_parts.append(probs.astype(np.float32, copy=False))
 
     targets = (labels > 0.5).astype(np.float32, copy=False)
     return row_indices, targets, np.concatenate(pred_parts, axis=0)
@@ -672,7 +671,6 @@ def _save_random_curtain_plots(
     use_base_features: bool,
     eval_batch_size: int,
     device: str,
-    pred_threshold: float,
     num_random_plots: int,
     curtain_rows: int,
     seed: int,
@@ -704,7 +702,6 @@ def _save_random_curtain_plots(
             use_base_features=use_base_features,
             eval_batch_size=eval_batch_size,
             device=device,
-            pred_threshold=pred_threshold,
         )
         window = _choose_contiguous_window(row_indices=row_indices, window_size=curtain_rows, rng=rng)
         if window is None:
@@ -720,14 +717,16 @@ def _save_random_curtain_plots(
         for ax, image, title in zip(
             axes,
             (targets[start:stop], preds[start:stop]),
-            ("Ground Truth", "Prediction"),
+            ("Ground Truth", "Prediction Probability"),
         ):
-            ax.imshow(image, aspect="auto", cmap="gray_r", vmin=0.0, vmax=1.0, interpolation="nearest")
+            ax.imshow(image.T, aspect="auto", cmap="gray_r", vmin=0.0, vmax=1.0, interpolation="nearest")
             ax.set_title(title)
-            ax.set_xlabel("Cloud mask column")
-        axes[0].set_ylabel("Feather row index")
-        y_ticks = np.linspace(0, curtain_rows - 1, num=min(5, curtain_rows), dtype=int)
-        axes[0].set_yticks(y_ticks, labels=[str(int(row_window[idx])) for idx in y_ticks])
+            ax.set_xlabel("Feather row index")
+        axes[0].set_ylabel("Cloud mask column")
+        x_ticks = np.linspace(0, curtain_rows - 1, num=min(5, curtain_rows), dtype=int)
+        x_labels = [str(int(row_window[idx])) for idx in x_ticks]
+        for ax in axes:
+            ax.set_xticks(x_ticks, labels=x_labels)
         axes[1].tick_params(axis="y", labelleft=False)
         fig.suptitle(
             f"{split_name.title()} cloud-mask curtain | {meta.source_file.name} | "
@@ -891,7 +890,6 @@ def train_model(
         use_base_features=use_base_features,
         eval_batch_size=eval_batch_size,
         device=device,
-        pred_threshold=test_metrics["iou_threshold"],
         num_random_plots=plot_random_curtain_count,
         curtain_rows=plot_curtain_rows,
         seed=seed,
