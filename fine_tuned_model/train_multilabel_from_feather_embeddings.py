@@ -200,7 +200,12 @@ def select_train_test_files(
     )
 
 
-def _load_one_file_arrays(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_one_file_arrays(
+    meta: FileMeta,
+    sample_ratio: float = 1.0,
+    max_samples_per_file: Optional[int] = None,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     required_cols = ["timestamp_0"] + BASE_FEATURE_COLUMNS + TARGET_COLUMNS
     df = pd.read_feather(meta.feather_path)
     missing = [c for c in required_cols if c not in df.columns]
@@ -226,6 +231,20 @@ def _load_one_file_arrays(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray, np.nd
         empty = np.empty((0, 0), dtype=np.float32)
         return empty, np.empty((0, 40), dtype=np.float32), np.empty((0,), dtype=np.int64)
 
+    if not (0 < sample_ratio <= 1.0):
+        raise ValueError("sample_ratio must be in (0, 1].")
+
+    sample_indices = np.arange(rows.shape[0], dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    if sample_ratio < 1.0:
+        count = max(1, int(len(sample_indices) * sample_ratio))
+        sample_indices = rng.choice(sample_indices, size=count, replace=False)
+    if max_samples_per_file is not None and max_samples_per_file > 0 and len(sample_indices) > max_samples_per_file:
+        sample_indices = rng.choice(sample_indices, size=max_samples_per_file, replace=False)
+    sample_indices = np.sort(sample_indices)
+    rows = rows[sample_indices]
+    emb = emb[sample_indices]
+
     emb_flat = emb.reshape(emb.shape[0], -1).astype(np.float32)
     base = df.iloc[rows][BASE_FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=True)
     y = df.iloc[rows][TARGET_COLUMNS].to_numpy(dtype=np.float32, copy=True)
@@ -235,16 +254,36 @@ def _load_one_file_arrays(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray, np.nd
     return x, y, rows
 
 
-def load_one_file_samples(meta: FileMeta) -> Tuple[np.ndarray, np.ndarray]:
-    x, y, _ = _load_one_file_arrays(meta)
+def load_one_file_samples(
+    meta: FileMeta,
+    sample_ratio: float = 1.0,
+    max_samples_per_file: Optional[int] = None,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    x, y, _ = _load_one_file_arrays(
+        meta,
+        sample_ratio=sample_ratio,
+        max_samples_per_file=max_samples_per_file,
+        seed=seed,
+    )
     return x, y
 
 
-def load_dataset(files: Sequence[FileMeta]) -> Tuple[np.ndarray, np.ndarray]:
+def load_dataset(
+    files: Sequence[FileMeta],
+    sample_ratio: float = 1.0,
+    max_samples_per_file: Optional[int] = None,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
     x_parts: List[np.ndarray] = []
     y_parts: List[np.ndarray] = []
-    for meta in files:
-        x, y = load_one_file_samples(meta)
+    for file_idx, meta in enumerate(files):
+        x, y = load_one_file_samples(
+            meta,
+            sample_ratio=sample_ratio,
+            max_samples_per_file=max_samples_per_file,
+            seed=seed + file_idx,
+        )
         if x.size == 0:
             continue
         x_parts.append(x)
@@ -726,6 +765,13 @@ def main() -> int:
         help="Comma-separated classifier hidden dims. Default: auto-scale from input_dim, e.g. 1024,512.",
     )
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--sample-ratio", type=float, default=0.3)
+    parser.add_argument(
+        "--max-samples-per-file",
+        type=int,
+        default=0,
+        help="Optional hard cap on sampled rows per file. 0 means no cap.",
+    )
     parser.add_argument("--no-pos-weight", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -780,8 +826,19 @@ def main() -> int:
     print(f"Train max file_time: {max(m.file_time for m in train_files)}")
     print(f"Test min file_time:  {min(m.file_time for m in test_files)}")
 
-    x_train, y_train = load_dataset(train_files)
-    x_test, y_test = load_dataset(test_files)
+    max_samples_per_file = None if args.max_samples_per_file <= 0 else int(args.max_samples_per_file)
+    x_train, y_train = load_dataset(
+        train_files,
+        sample_ratio=args.sample_ratio,
+        max_samples_per_file=max_samples_per_file,
+        seed=args.seed,
+    )
+    x_test, y_test = load_dataset(
+        test_files,
+        sample_ratio=args.sample_ratio,
+        max_samples_per_file=max_samples_per_file,
+        seed=args.seed,
+    )
     print(f"Train samples: {x_train.shape[0]} | Feature dim: {x_train.shape[1]} | Targets: {y_train.shape[1]}")
     print(f"Test samples:  {x_test.shape[0]}")
 
