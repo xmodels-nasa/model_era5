@@ -15,6 +15,7 @@ Outputs one `.npz` file per feather file (same stem), containing:
 """
 
 import os
+import random
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -65,15 +66,42 @@ EMBEDDING_3X3_OUTPUT_DIR = os.getenv(
 )
 MAX_FILE_WORKERS = 10
 GRID_SIZE = 3
+DEFAULT_TEST_START_TIME = "2019-07-01T00:00:00Z"
+TRAIN_FILE_SAMPLE_COUNT = 100
+TEST_FILE_SAMPLE_COUNT = 10
+FILE_SAMPLE_SEED = 42
 
 
 def _safe_stem(path: Path) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", path.stem)
 
 
+def _timestamp_unit_from_value(v: int) -> str:
+    return "s" if len(str(abs(int(v)))) <= 10 else "ms"
+
+
+def _file_time(feather_path: Path) -> Optional[pd.Timestamp]:
+    df_ts = pd.read_feather(feather_path, columns=["timestamp_0"])
+    if len(df_ts) == 0:
+        return None
+    first = int(df_ts["timestamp_0"].iloc[0])
+    unit = _timestamp_unit_from_value(first)
+    ts = pd.to_datetime(df_ts["timestamp_0"], unit=unit, utc=True)
+    return pd.Timestamp(ts.max())
+
+
+def _parse_utc_timestamp(value: str) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
 def _build_target_column(df: pd.DataFrame) -> pd.Series:
     first_ts = int(df["timestamp_0"].iloc[0])
-    unit = "s" if len(str(abs(first_ts))) <= 10 else "ms"
+    unit = _timestamp_unit_from_value(first_ts)
     df_dt = pd.to_datetime(df["timestamp_0"], unit=unit, utc=True)
     hour_floor = df_dt.dt.floor("h")
     round_up = (df_dt - hour_floor) > pd.Timedelta(minutes=30)
@@ -287,6 +315,53 @@ def process_one_feather_file(feather_file: str, output_dir: str, data_root: str)
     }
 
 
+def _select_sampled_feather_files(feather_files: List[Path]) -> List[Path]:
+    cutoff = _parse_utc_timestamp(DEFAULT_TEST_START_TIME)
+    rng = random.Random(FILE_SAMPLE_SEED)
+
+    before_cutoff: List[Tuple[pd.Timestamp, Path]] = []
+    after_cutoff: List[Tuple[pd.Timestamp, Path]] = []
+    empty_files = 0
+
+    for feather_path in feather_files:
+        file_time = _file_time(feather_path)
+        if file_time is None:
+            empty_files += 1
+            continue
+        if file_time < cutoff:
+            before_cutoff.append((file_time, feather_path))
+        else:
+            after_cutoff.append((file_time, feather_path))
+
+    if len(before_cutoff) < TRAIN_FILE_SAMPLE_COUNT:
+        raise ValueError(
+            f"Need {TRAIN_FILE_SAMPLE_COUNT} feather files before {cutoff}, "
+            f"but only found {len(before_cutoff)}."
+        )
+    if len(after_cutoff) < TEST_FILE_SAMPLE_COUNT:
+        raise ValueError(
+            f"Need {TEST_FILE_SAMPLE_COUNT} feather files on or after {cutoff}, "
+            f"but only found {len(after_cutoff)}."
+        )
+
+    before_selected = rng.sample(before_cutoff, k=TRAIN_FILE_SAMPLE_COUNT)
+    after_selected = rng.sample(after_cutoff, k=TEST_FILE_SAMPLE_COUNT)
+    combined = before_selected + after_selected
+    combined.sort(key=lambda item: (item[0], str(item[1])))
+
+    print(f"Sampling feather files with cutoff {cutoff}")
+    print(
+        f"Available before cutoff: {len(before_cutoff)} | selected: {TRAIN_FILE_SAMPLE_COUNT}"
+    )
+    print(
+        f"Available on/after cutoff: {len(after_cutoff)} | selected: {TEST_FILE_SAMPLE_COUNT}"
+    )
+    if empty_files:
+        print(f"Skipped empty feather files during sampling: {empty_files}")
+
+    return [path for _, path in combined]
+
+
 def main() -> List[Dict[str, object]]:
     if not FEATHER_ROOT:
         raise ValueError("FEATHER_ROOT is not set. Add FEATHER_ROOT to .env.")
@@ -295,14 +370,15 @@ def main() -> List[Dict[str, object]]:
     if not root.exists():
         raise FileNotFoundError(f"FEATHER_ROOT does not exist: {root}")
 
-    feather_files = sorted(str(p) for p in root.rglob("*.feather"))
+    feather_paths = sorted(root.rglob("*.feather"))
+    feather_files = [str(p) for p in _select_sampled_feather_files(feather_paths)]
     if not feather_files:
         raise FileNotFoundError(f"No .feather files found under FEATHER_ROOT: {root}")
 
     out_dir = Path(EMBEDDING_3X3_OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Found {len(feather_files)} feather file(s)")
+    print(f"Selected {len(feather_files)} feather file(s)")
     print(f"Writing 3x3 embeddings to: {out_dir}")
     print(f"Parallel file workers: {MAX_FILE_WORKERS}")
 
