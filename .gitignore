@@ -9,7 +9,7 @@ __pycache__/
 
 # Data directories (any path segment starting with "data")
 **/data*/
-embeddings/
+embeddings*/
 raw_chips/
 
 # Notebooks
