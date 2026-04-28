@@ -186,10 +186,15 @@ def _load_one_file_arrays(
 
     if emb.size == 0 or rows.size == 0:
         return _empty_base_array(), _empty_grid_array(), np.empty((0, 40), dtype=np.float32), np.empty((0,), dtype=np.int64)
-    if emb.ndim != 5:
+    if emb.ndim < 5:
         raise ValueError(
             f"Unexpected 3x3 embedding shape in {meta.npz_path.name}: {emb.shape}. "
-            "Expected [rows, 3, 3, latent_levels, embed_dim]."
+            "Expected [rows, 3, 3, ...] with one or more trailing embedding dimensions."
+        )
+    if emb.shape[1] != 3 or emb.shape[2] != 3:
+        raise ValueError(
+            f"Unexpected spatial grid shape in {meta.npz_path.name}: {emb.shape}. "
+            "Expected axes 1 and 2 to be the 3x3 neighborhood."
         )
 
     rows = rows.astype(np.int64, copy=False)
@@ -423,16 +428,19 @@ class Grid3x3EmbeddingClassifier(nn.Module):
         dropout: float,
     ):
         super().__init__()
-        if len(grid_shape) != 4:
-            raise ValueError(f"grid_shape must be [3, 3, latent_levels, embed_dim], got {grid_shape}")
+        if len(grid_shape) < 4:
+            raise ValueError(f"grid_shape must be [3, 3, ...], got {grid_shape}")
 
-        grid_h, grid_w, latent_levels, embed_dim = [int(v) for v in grid_shape]
+        grid_h = int(grid_shape[0])
+        grid_w = int(grid_shape[1])
+        cell_shape = tuple(int(v) for v in grid_shape[2:])
         if grid_h != 3 or grid_w != 3:
             raise ValueError(f"Expected a 3x3 grid, got {grid_shape}")
 
-        self.grid_shape = (grid_h, grid_w, latent_levels, embed_dim)
+        self.grid_shape = (grid_h, grid_w, *cell_shape)
+        self.cell_shape = cell_shape
         self.num_tokens = grid_h * grid_w
-        self.cell_input_dim = latent_levels * embed_dim
+        self.cell_input_dim = int(np.prod(cell_shape))
         self.token_dim = int(token_dim)
         self.head_dims = tuple(int(dim) for dim in head_dims)
 
@@ -748,7 +756,7 @@ def train_model(
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
     resolved_token_dim = _resolve_token_dim(
-        cell_input_dim=int(grid_train.shape[-2] * grid_train.shape[-1]),
+        cell_input_dim=int(np.prod(grid_train.shape[3:])),
         requested_token_dim=token_dim,
         spatial_heads=spatial_heads,
     )
@@ -891,6 +899,7 @@ def _save_artifacts(
             "model_state_dict": model.state_dict(),
             "output_dim": 40,
             "grid_shape": list(model.grid_shape),
+            "cell_shape": list(model.cell_shape),
             "cell_input_dim": int(model.cell_input_dim),
             "token_dim": int(token_dim),
             "head_dims": list(head_dims),

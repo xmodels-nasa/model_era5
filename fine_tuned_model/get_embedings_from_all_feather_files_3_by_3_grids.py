@@ -8,7 +8,8 @@ For each source row, this script:
 
 Outputs one `.npz` file per feather file (same stem), containing:
     - `emb_3x3_all_levels`: stacked 3x3 embeddings for successful rows
-      with shape [rows, 3, 3, latent_levels, embed_dim]
+      with shape [rows, 3, 3, ...], where the trailing embedding shape is
+      whatever Aurora returns for one grid cell after the leading batch axis is removed
     - `row_indices`: source row index for each embedding entry
     - `grid_lats`: matched ERA5 latitudes for each 3x3 neighborhood
     - `grid_lons`: matched ERA5 longitudes for each 3x3 neighborhood
@@ -179,6 +180,8 @@ def _extract_3x3_embedding_grid(
                 lat=grid_lat,
                 lon=grid_lon,
             )["emb_all_levels"].detach().cpu().numpy()
+            # Aurora may return more than one latent axis here, e.g. [1, 2, 4, 512].
+            # Strip only the leading batch axis and preserve the full per-cell embedding shape.
             if emb.shape[0] == 1:
                 emb = emb[0]
             row_embeddings.append(emb.astype(np.float32, copy=False))

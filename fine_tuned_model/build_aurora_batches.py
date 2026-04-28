@@ -428,7 +428,7 @@ def get_embedding_from_encoder_context(
         "matched_lon": nearest_lon,
         "patch_idx": patch_idx,
         "token_indices": token_indices,
-        "emb_all_levels": emb_all,  # shape: [B, latent_levels, D]
+        "emb_all_levels": emb_all,  # shape: [B, ...] with trailing dims determined by token_indices
         "enc_out_shape": tuple(enc_out.shape),
     }
 
