@@ -357,74 +357,26 @@ def _binary_metrics(
     }
 
 
-def _resolve_token_dim(
-    cell_input_dim: int,
-    requested_token_dim: Optional[int],
-    spatial_heads: int,
-) -> int:
-    if spatial_heads < 1:
-        raise ValueError("spatial_heads must be at least 1")
-
-    if requested_token_dim is not None and requested_token_dim > 0:
-        token_dim = int(requested_token_dim)
-        if token_dim % spatial_heads != 0:
-            raise ValueError(
-                f"token_dim={token_dim} must be divisible by spatial_heads={spatial_heads}."
-            )
-        return token_dim
-
-    token_dim = int(min(384, max(96, cell_input_dim // 8)))
-    token_dim = max(spatial_heads, ((token_dim + spatial_heads - 1) // spatial_heads) * spatial_heads)
-    return token_dim
-
-
-def _resolve_head_dims(token_dim: int, requested_head_dims: Optional[Sequence[int]]) -> List[int]:
-    if requested_head_dims:
-        dims = [int(d) for d in requested_head_dims if int(d) > 0]
+def _resolve_hidden_dims(input_dim: int, hidden_dims: Optional[Sequence[int]]) -> List[int]:
+    if hidden_dims:
+        dims = [int(d) for d in hidden_dims if int(d) > 0]
         if dims:
             return dims
-    first = min(1024, max(256, token_dim * 4))
-    second = min(512, max(128, first // 2))
+
+    first = min(4096, max(1024, input_dim // 4))
+    second = min(2048, max(512, first // 2))
+    if second >= first:
+        second = max(512, first // 2)
     return [first, second]
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, token_dim: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(token_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=token_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm2 = nn.LayerNorm(token_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(token_dim, token_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(token_dim * 4, token_dim),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_in = self.norm1(x)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
-        x = x + self.dropout(attn_out)
-        x = x + self.dropout(self.ffn(self.norm2(x)))
-        return x
-
-
-class Grid3x3EmbeddingClassifier(nn.Module):
+class Grid3x3EmbeddingMLP(nn.Module):
     def __init__(
         self,
         base_dim: int,
         grid_shape: Sequence[int],
         output_dim: int,
-        token_dim: int,
-        head_dims: Sequence[int],
-        spatial_depth: int,
-        spatial_heads: int,
+        hidden_dims: Optional[Sequence[int]],
         dropout: float,
     ):
         super().__init__()
@@ -439,60 +391,29 @@ class Grid3x3EmbeddingClassifier(nn.Module):
 
         self.grid_shape = (grid_h, grid_w, *cell_shape)
         self.cell_shape = cell_shape
-        self.num_tokens = grid_h * grid_w
-        self.cell_input_dim = int(np.prod(cell_shape))
-        self.token_dim = int(token_dim)
-        self.head_dims = tuple(int(dim) for dim in head_dims)
+        self.grid_input_dim = int(np.prod(grid_shape))
+        self.input_dim = int(base_dim + self.grid_input_dim)
+        resolved_hidden_dims = _resolve_hidden_dims(self.input_dim, hidden_dims)
+        self.hidden_dims = tuple(resolved_hidden_dims)
 
-        self.cell_encoder = nn.Sequential(
-            nn.LayerNorm(self.cell_input_dim),
-            nn.Linear(self.cell_input_dim, self.token_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.token_dim, self.token_dim),
-            nn.GELU(),
-        )
-        self.pos_embedding = nn.Parameter(torch.zeros(1, self.num_tokens, self.token_dim))
-        self.spatial_blocks = nn.ModuleList(
-            [TransformerBlock(token_dim=self.token_dim, num_heads=spatial_heads, dropout=dropout) for _ in range(spatial_depth)]
-        )
-        self.base_encoder = nn.Sequential(
-            nn.LayerNorm(base_dim),
-            nn.Linear(base_dim, 64),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        fusion_layers: List[nn.Module] = []
-        prev_dim = self.token_dim * 3 + 64
-        for hidden_dim in self.head_dims:
-            fusion_layers.extend(
+        layers: List[nn.Module] = []
+        prev_dim = self.input_dim
+        for hidden_dim in self.hidden_dims:
+            layers.extend(
                 [
                     nn.Linear(prev_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.GELU(),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
                     nn.Dropout(dropout),
                 ]
             )
             prev_dim = hidden_dim
-        fusion_layers.append(nn.Linear(prev_dim, output_dim))
-        self.head = nn.Sequential(*fusion_layers)
-
-        nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, base_x: torch.Tensor, grid_x: torch.Tensor) -> torch.Tensor:
-        batch_size = grid_x.shape[0]
-        tokens = grid_x.reshape(batch_size, self.num_tokens, self.cell_input_dim)
-        tokens = self.cell_encoder(tokens) + self.pos_embedding
-        for block in self.spatial_blocks:
-            tokens = block(tokens)
-
-        center_token = tokens[:, self.num_tokens // 2]
-        mean_token = tokens.mean(dim=1)
-        max_token = tokens.amax(dim=1)
-        base_features = self.base_encoder(base_x)
-        fused = torch.cat([center_token, mean_token, max_token, base_features], dim=1)
-        return self.head(fused)
+        fused = torch.cat([base_x, grid_x.reshape(grid_x.shape[0], -1)], dim=1)
+        return self.net(fused)
 
 
 def _evaluate_in_batches(
@@ -714,10 +635,7 @@ def train_model(
     lr: float,
     weight_decay: float,
     grad_clip_norm: float,
-    token_dim: Optional[int],
-    head_dims: Optional[Sequence[int]],
-    spatial_depth: int,
-    spatial_heads: int,
+    hidden_dims: Optional[Sequence[int]],
     dropout: float,
     use_pos_weight: bool,
     seed: int,
@@ -755,29 +673,18 @@ def train_model(
     train_ds = TensorDataset(base_train_t, grid_train_t, y_train_t)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    resolved_token_dim = _resolve_token_dim(
-        cell_input_dim=int(np.prod(grid_train.shape[3:])),
-        requested_token_dim=token_dim,
-        spatial_heads=spatial_heads,
-    )
-    resolved_head_dims = _resolve_head_dims(token_dim=resolved_token_dim, requested_head_dims=head_dims)
-
-    model = Grid3x3EmbeddingClassifier(
+    model = Grid3x3EmbeddingMLP(
         base_dim=base_train.shape[1],
         grid_shape=grid_train.shape[1:],
         output_dim=y_train.shape[1],
-        token_dim=resolved_token_dim,
-        head_dims=resolved_head_dims,
-        spatial_depth=spatial_depth,
-        spatial_heads=spatial_heads,
+        hidden_dims=hidden_dims,
         dropout=dropout,
     ).to(device)
     print(
         "Classifier config | "
         f"grid_shape={tuple(int(v) for v in grid_train.shape[1:])} | "
-        f"cell_input_dim={model.cell_input_dim} | token_dim={resolved_token_dim} | "
-        f"head_dims={resolved_head_dims} | spatial_depth={spatial_depth} | "
-        f"spatial_heads={spatial_heads} | dropout={dropout:.3f}"
+        f"grid_input_dim={model.grid_input_dim} | input_dim={model.input_dim} | "
+        f"hidden_dims={list(model.hidden_dims)} | dropout={dropout:.3f}"
     )
 
     if use_pos_weight:
@@ -864,17 +771,16 @@ def train_model(
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
         "grid_shape": tuple(int(v) for v in grid_train.shape[1:]),
-        "token_dim": int(resolved_token_dim),
-        "head_dims": list(resolved_head_dims),
+        "grid_input_dim": int(model.grid_input_dim),
+        "input_dim": int(model.input_dim),
+        "hidden_dims": list(model.hidden_dims),
         "dropout": float(dropout),
-        "spatial_depth": int(spatial_depth),
-        "spatial_heads": int(spatial_heads),
     }
 
 
 def _save_artifacts(
     out_dir: Path,
-    model: Grid3x3EmbeddingClassifier,
+    model: Grid3x3EmbeddingMLP,
     base_mean: np.ndarray,
     base_std: np.ndarray,
     grid_mean: np.ndarray,
@@ -883,14 +789,12 @@ def _save_artifacts(
     test_files: Sequence[FileMeta],
     train_metrics: Dict[str, float],
     test_metrics: Dict[str, float],
-    token_dim: int,
-    head_dims: Sequence[int],
+    input_dim: int,
+    hidden_dims: Sequence[int],
     dropout: float,
-    spatial_depth: int,
-    spatial_heads: int,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    model_path = out_dir / "multilabel_grid3x3_transformer.pt"
+    model_path = out_dir / "multilabel_grid3x3_mlp.pt"
     stats_path = out_dir / "feature_stats_3x3.npz"
     split_path = out_dir / "file_split.csv"
 
@@ -900,12 +804,10 @@ def _save_artifacts(
             "output_dim": 40,
             "grid_shape": list(model.grid_shape),
             "cell_shape": list(model.cell_shape),
-            "cell_input_dim": int(model.cell_input_dim),
-            "token_dim": int(token_dim),
-            "head_dims": list(head_dims),
+            "grid_input_dim": int(model.grid_input_dim),
+            "input_dim": int(input_dim),
+            "hidden_dims": list(hidden_dims),
             "dropout": float(dropout),
-            "spatial_depth": int(spatial_depth),
-            "spatial_heads": int(spatial_heads),
             "base_features": BASE_FEATURE_COLUMNS,
             "target_columns": TARGET_COLUMNS,
             "train_metrics": train_metrics,
@@ -937,7 +839,7 @@ def main() -> int:
     def _parse_hidden_dims(value: str) -> List[int]:
         dims = [int(part.strip()) for part in value.split(",") if part.strip()]
         if not dims or any(dim <= 0 for dim in dims):
-            raise argparse.ArgumentTypeError("head dims must be a comma-separated list of positive integers")
+            raise argparse.ArgumentTypeError("hidden dims must be a comma-separated list of positive integers")
         return dims
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -962,19 +864,11 @@ def main() -> int:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument(
-        "--token-dim",
-        type=int,
-        default=0,
-        help="Per-cell token width after shared projection. 0 means auto-scale from cell size.",
-    )
-    parser.add_argument(
-        "--head-dims",
+        "--hidden-dims",
         type=_parse_hidden_dims,
         default=None,
-        help="Comma-separated fusion head dims. Default: auto-scale from token_dim.",
+        help="Comma-separated classifier hidden dims. Default: auto-scale from flattened input_dim.",
     )
-    parser.add_argument("--spatial-depth", type=int, default=2)
-    parser.add_argument("--spatial-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.15)
     parser.add_argument("--sample-ratio", type=float, default=0.3)
     parser.add_argument(
@@ -1014,10 +908,6 @@ def main() -> int:
         raise ValueError("FEATHER_ROOT is not set (or pass --feather-root).")
     if not args.embedding_dir:
         raise ValueError("EMBEDDING_3X3_OUTPUT_DIR is not set (or pass --embedding-dir).")
-    if args.spatial_depth < 1:
-        raise ValueError("spatial_depth must be at least 1")
-    if args.spatial_heads < 1:
-        raise ValueError("spatial_heads must be at least 1")
 
     feather_root = Path(args.feather_root)
     embedding_dir = Path(args.embedding_dir)
@@ -1074,10 +964,7 @@ def main() -> int:
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
-        token_dim=(None if args.token_dim <= 0 else args.token_dim),
-        head_dims=args.head_dims,
-        spatial_depth=args.spatial_depth,
-        spatial_heads=args.spatial_heads,
+        hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         use_pos_weight=(not args.no_pos_weight),
         seed=args.seed,
@@ -1110,11 +997,9 @@ def main() -> int:
         test_files=test_files,
         train_metrics=fit["train_metrics"],
         test_metrics=fit["test_metrics"],
-        token_dim=fit["token_dim"],
-        head_dims=fit["head_dims"],
+        input_dim=fit["input_dim"],
+        hidden_dims=fit["hidden_dims"],
         dropout=fit["dropout"],
-        spatial_depth=fit["spatial_depth"],
-        spatial_heads=fit["spatial_heads"],
     )
     return 0
 
