@@ -976,7 +976,7 @@ def main() -> int:
     parser.add_argument("--spatial-depth", type=int, default=2)
     parser.add_argument("--spatial-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.15)
-    parser.add_argument("--sample-ratio", type=float, default=1.0)
+    parser.add_argument("--sample-ratio", type=float, default=0.3)
     parser.add_argument(
         "--max-samples-per-file",
         type=int,
