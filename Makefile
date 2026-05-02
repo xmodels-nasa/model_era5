@@ -2,7 +2,7 @@
 
 FT_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings.py
 FT_3X3_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings_3x3.py
-FT_3X3_ARGS := --sample-ratio 0.3
+FT_3X3_ARGS := --sample-ratio 0.5
 EMBEDDING_SCRIPT := fine_tuned_model/get_embedings_from_all_feather_files_3_by_3_grids.py
 RAW_CHIPS_SCRIPT := baseline_model/get_raw_chips_from_all_feather_files.py
 BASELINE_TRAIN_SCRIPT := baseline_model/train_multilabel_from_raw_chips.py

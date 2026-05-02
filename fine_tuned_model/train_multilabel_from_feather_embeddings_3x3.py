@@ -640,6 +640,8 @@ def train_model(
     use_pos_weight: bool,
     seed: int,
     device: str,
+    early_stop_patience: int,
+    early_stop_min_delta: float,
     plot_random_curtain_count: int,
     plot_curtain_rows: int,
     plot_dir: Path,
@@ -696,6 +698,16 @@ def train_model(
         loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    best_epoch = 0
+    best_score = float("-inf")
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    best_train_metrics: Optional[Dict[str, float]] = None
+    best_test_metrics: Optional[Dict[str, float]] = None
+    best_train_loss = float("nan")
+    best_train_eval_loss = float("nan")
+    best_test_loss = float("nan")
+    epochs_without_improvement = 0
+
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
@@ -746,6 +758,39 @@ def train_model(
             f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f}"
         )
 
+        score = float(test_metrics["iou_mean"])
+        if score > best_score + early_stop_min_delta:
+            best_epoch = epoch
+            best_score = score
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_train_metrics = dict(train_metrics)
+            best_test_metrics = dict(test_metrics)
+            best_train_loss = float(train_loss)
+            best_train_eval_loss = float(train_eval_loss)
+            best_test_loss = float(test_loss)
+            epochs_without_improvement = 0
+            print(f"  New best validation IoU: {best_score:.4f} at epoch {best_epoch:03d}")
+        else:
+            epochs_without_improvement += 1
+            if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
+                print(
+                    f"Early stopping at epoch {epoch:03d}; best validation IoU "
+                    f"{best_score:.4f} was at epoch {best_epoch:03d}."
+                )
+                break
+
+    if best_state_dict is None or best_train_metrics is None or best_test_metrics is None:
+        raise RuntimeError("Training finished without recording a best model state.")
+    model.load_state_dict(best_state_dict)
+    train_metrics = best_train_metrics
+    test_metrics = best_test_metrics
+    print(
+        "Using best epoch | "
+        f"epoch={best_epoch:03d} | train_loss={best_train_loss:.5f} | "
+        f"train_eval_loss={best_train_eval_loss:.5f} | test_loss={best_test_loss:.5f} | "
+        f"test_iou_mean={best_score:.4f} @thr={test_metrics['iou_threshold']:.3f}"
+    )
+
     _save_random_curtain_plots(
         out_dir=plot_dir,
         split_name="validation",
@@ -775,6 +820,10 @@ def train_model(
         "input_dim": int(model.input_dim),
         "hidden_dims": list(model.hidden_dims),
         "dropout": float(dropout),
+        "best_epoch": int(best_epoch),
+        "best_score": float(best_score),
+        "early_stop_patience": int(early_stop_patience),
+        "early_stop_min_delta": float(early_stop_min_delta),
     }
 
 
@@ -792,6 +841,10 @@ def _save_artifacts(
     input_dim: int,
     hidden_dims: Sequence[int],
     dropout: float,
+    best_epoch: int,
+    best_score: float,
+    early_stop_patience: int,
+    early_stop_min_delta: float,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model_path = out_dir / "multilabel_grid3x3_mlp.pt"
@@ -812,6 +865,10 @@ def _save_artifacts(
             "target_columns": TARGET_COLUMNS,
             "train_metrics": train_metrics,
             "test_metrics": test_metrics,
+            "best_epoch": int(best_epoch),
+            "best_score": float(best_score),
+            "early_stop_patience": int(early_stop_patience),
+            "early_stop_min_delta": float(early_stop_min_delta),
         },
         model_path,
     )
@@ -870,7 +927,7 @@ def main() -> int:
         help="Comma-separated classifier hidden dims. Default: auto-scale from flattened input_dim.",
     )
     parser.add_argument("--dropout", type=float, default=0.15)
-    parser.add_argument("--sample-ratio", type=float, default=0.3)
+    parser.add_argument("--sample-ratio", type=float, default=0.5)
     parser.add_argument(
         "--max-samples-per-file",
         type=int,
@@ -879,6 +936,18 @@ def main() -> int:
     )
     parser.add_argument("--no-pos-weight", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=3,
+        help="Stop after this many epochs without validation IoU improvement. 0 disables early stopping.",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation IoU improvement needed to reset early-stop patience.",
+    )
     parser.add_argument(
         "--test-start-time",
         type=str,
@@ -908,6 +977,10 @@ def main() -> int:
         raise ValueError("FEATHER_ROOT is not set (or pass --feather-root).")
     if not args.embedding_dir:
         raise ValueError("EMBEDDING_3X3_OUTPUT_DIR is not set (or pass --embedding-dir).")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early-stop-patience must be >= 0.")
+    if args.early_stop_min_delta < 0:
+        raise ValueError("--early-stop-min-delta must be >= 0.")
 
     feather_root = Path(args.feather_root)
     embedding_dir = Path(args.embedding_dir)
@@ -969,6 +1042,8 @@ def main() -> int:
         use_pos_weight=(not args.no_pos_weight),
         seed=args.seed,
         device=args.device,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
         plot_random_curtain_count=args.plot_random_curtain_count,
         plot_curtain_rows=args.plot_curtain_rows,
         plot_dir=Path(args.plot_dir),
@@ -983,7 +1058,8 @@ def main() -> int:
         f"train_auc_macro={fit['train_metrics']['auc_macro']:.4f}, "
         f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}, "
         f"train_iou_mean={fit['train_metrics']['iou_mean']:.4f} @thr={fit['train_metrics']['iou_threshold']:.3f}, "
-        f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f} @thr={fit['test_metrics']['iou_threshold']:.3f}"
+        f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f} @thr={fit['test_metrics']['iou_threshold']:.3f}, "
+        f"best_epoch={fit['best_epoch']}"
     )
 
     _save_artifacts(
@@ -1000,6 +1076,10 @@ def main() -> int:
         input_dim=fit["input_dim"],
         hidden_dims=fit["hidden_dims"],
         dropout=fit["dropout"],
+        best_epoch=fit["best_epoch"],
+        best_score=fit["best_score"],
+        early_stop_patience=fit["early_stop_patience"],
+        early_stop_min_delta=fit["early_stop_min_delta"],
     )
     return 0
 
