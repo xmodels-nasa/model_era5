@@ -665,6 +665,7 @@ def _predict_masks_for_file(
 def _save_random_curtain_plots(
     out_dir: Path,
     split_name: str,
+    file_prefix: str,
     model: nn.Module,
     files: Sequence[FileMeta],
     stats: NormalizationStats,
@@ -673,6 +674,7 @@ def _save_random_curtain_plots(
     device: str,
     num_random_plots: int,
     curtain_rows: int,
+    prediction_threshold: float,
     seed: int,
 ) -> None:
     if num_random_plots <= 0:
@@ -709,15 +711,18 @@ def _save_random_curtain_plots(
 
         start, stop = window
         row_window = row_indices[start:stop]
+        safe_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", file_prefix.strip()) if file_prefix.strip() else "plot"
         sample_path = out_dir / (
-            f"{split_name}_curtain_{saved + 1:02d}_{_safe_stem(meta.source_file)}"
+            f"{safe_prefix}_{split_name}_curtain_{saved + 1:02d}_{_safe_stem(meta.source_file)}"
             f"_rows_{int(row_window[0]):06d}_{int(row_window[-1]):06d}.png"
         )
-        fig, axes = plt.subplots(1, 2, figsize=(14, 8), sharey=True)
+        pred_probs = preds[start:stop]
+        pred_classes = (pred_probs >= prediction_threshold).astype(np.float32)
+        fig, axes = plt.subplots(1, 3, figsize=(20, 8), sharey=True)
         for ax, image, title in zip(
             axes,
-            (targets[start:stop], preds[start:stop]),
-            ("Ground Truth", "Prediction Probability"),
+            (targets[start:stop], pred_probs, pred_classes),
+            ("Ground Truth", "Prediction Probability", f"Prediction Class @thr={prediction_threshold:.3f}"),
         ):
             ax.imshow(image.T, aspect="auto", cmap="gray_r", vmin=0.0, vmax=1.0, interpolation="nearest")
             ax.set_title(title)
@@ -727,7 +732,8 @@ def _save_random_curtain_plots(
         x_labels = [str(int(row_window[idx])) for idx in x_ticks]
         for ax in axes:
             ax.set_xticks(x_ticks, labels=x_labels)
-        axes[1].tick_params(axis="y", labelleft=False)
+        for ax in axes[1:]:
+            ax.tick_params(axis="y", labelleft=False)
         fig.suptitle(
             f"{split_name.title()} cloud-mask curtain | {meta.source_file.name} | "
             f"rows {int(row_window[0])}-{int(row_window[-1])}",
@@ -763,9 +769,12 @@ def train_model(
     use_base_features: bool,
     seed: int,
     device: str,
+    early_stop_patience: int,
+    early_stop_min_delta: float,
     plot_random_curtain_count: int,
     plot_curtain_rows: int,
     plot_dir: Path,
+    plot_file_prefix: str,
     sample_ratio: float,
     max_samples_per_file: Optional[int],
 ) -> Dict[str, object]:
@@ -816,6 +825,17 @@ def train_model(
     else:
         loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_epoch = 0
+    best_score = float("-inf")
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    best_train_metrics: Optional[Dict[str, float]] = None
+    best_test_metrics: Optional[Dict[str, float]] = None
+    best_train_loss = float("nan")
+    best_train_eval_loss = float("nan")
+    best_test_loss = float("nan")
+    epochs_without_improvement = 0
+
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
@@ -881,9 +901,43 @@ def train_model(
             f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f}"
         )
 
+        score = float(test_metrics["iou_mean"])
+        if score > best_score + early_stop_min_delta:
+            best_epoch = epoch
+            best_score = score
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_train_metrics = dict(train_metrics)
+            best_test_metrics = dict(test_metrics)
+            best_train_loss = float(train_loss)
+            best_train_eval_loss = float(train_eval_loss)
+            best_test_loss = float(test_loss)
+            epochs_without_improvement = 0
+            print(f"  New best validation IoU: {best_score:.4f} at epoch {best_epoch:03d}")
+        else:
+            epochs_without_improvement += 1
+            if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
+                print(
+                    f"Early stopping at epoch {epoch:03d}; best validation IoU "
+                    f"{best_score:.4f} was at epoch {best_epoch:03d}."
+                )
+                break
+
+    if best_state_dict is None or best_train_metrics is None or best_test_metrics is None:
+        raise RuntimeError("Training finished without recording a best model state.")
+    model.load_state_dict(best_state_dict)
+    train_metrics = best_train_metrics
+    test_metrics = best_test_metrics
+    print(
+        "Using best epoch | "
+        f"epoch={best_epoch:03d} | train_loss={best_train_loss:.5f} | "
+        f"train_eval_loss={best_train_eval_loss:.5f} | test_loss={best_test_loss:.5f} | "
+        f"test_iou_mean={best_score:.4f} @thr={test_metrics['iou_threshold']:.3f}"
+    )
+
     _save_random_curtain_plots(
         out_dir=plot_dir,
         split_name="validation",
+        file_prefix=plot_file_prefix,
         model=model,
         files=test_files,
         stats=stats,
@@ -892,6 +946,7 @@ def train_model(
         device=device,
         num_random_plots=plot_random_curtain_count,
         curtain_rows=plot_curtain_rows,
+        prediction_threshold=float(test_metrics["iou_threshold"]),
         seed=seed,
     )
 
@@ -906,6 +961,10 @@ def train_model(
         "chip_size": int(chip_size),
         "channel_names": channel_names,
         "use_base_features": bool(use_base_features),
+        "best_epoch": int(best_epoch),
+        "best_score": float(best_score),
+        "early_stop_patience": int(early_stop_patience),
+        "early_stop_min_delta": float(early_stop_min_delta),
     }
 
 
@@ -923,6 +982,10 @@ def _save_artifacts(
     chip_size: int,
     channel_names: np.ndarray,
     use_base_features: bool,
+    best_epoch: int,
+    best_score: float,
+    early_stop_patience: int,
+    early_stop_min_delta: float,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model_path = out_dir / "multilabel_unet_classifier.pt"
@@ -942,6 +1005,10 @@ def _save_artifacts(
             "target_columns": TARGET_COLUMNS,
             "train_metrics": train_metrics,
             "test_metrics": test_metrics,
+            "best_epoch": int(best_epoch),
+            "best_score": float(best_score),
+            "early_stop_patience": int(early_stop_patience),
+            "early_stop_min_delta": float(early_stop_min_delta),
         },
         model_path,
     )
@@ -984,6 +1051,18 @@ def main() -> int:
     parser.add_argument("--no-base-features", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=3,
+        help="Stop after this many epochs without validation IoU improvement. 0 disables early stopping.",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation IoU improvement needed to reset early-stop patience.",
+    )
+    parser.add_argument(
         "--test-start-time",
         type=str,
         default=DEFAULT_TEST_START_TIME,
@@ -996,8 +1075,14 @@ def main() -> int:
         "--plot-random-iou-count",
         dest="plot_random_curtain_count",
         type=int,
-        default=6,
+        default=10,
         help="Number of random validation curtain plots to save in --plot-dir. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--plot-file-prefix",
+        type=str,
+        default="raw_chips",
+        help="Prefix added to validation curtain PNG filenames.",
     )
     parser.add_argument(
         "--plot-curtain-rows",
@@ -1011,6 +1096,10 @@ def main() -> int:
     raw_chip_dir = Path(args.raw_chip_dir)
     if not raw_chip_dir.exists():
         raise FileNotFoundError(f"Raw chip dir does not exist: {raw_chip_dir}")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early-stop-patience must be >= 0.")
+    if args.early_stop_min_delta < 0:
+        raise ValueError("--early-stop-min-delta must be >= 0.")
 
     metas = discover_files(raw_chip_dir)
     test_start_time = _parse_utc_timestamp(args.test_start_time)
@@ -1042,9 +1131,12 @@ def main() -> int:
         use_base_features=(not args.no_base_features),
         seed=args.seed,
         device=args.device,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
         plot_random_curtain_count=args.plot_random_curtain_count,
         plot_curtain_rows=args.plot_curtain_rows,
         plot_dir=Path(args.plot_dir),
+        plot_file_prefix=args.plot_file_prefix,
         sample_ratio=args.sample_ratio,
         max_samples_per_file=(None if args.max_samples_per_file <= 0 else int(args.max_samples_per_file)),
     )
@@ -1058,7 +1150,8 @@ def main() -> int:
         f"train_auc_macro={fit['train_metrics']['auc_macro']:.4f}, "
         f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}, "
         f"train_iou_mean={fit['train_metrics']['iou_mean']:.4f} @thr={fit['train_metrics']['iou_threshold']:.3f}, "
-        f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f} @thr={fit['test_metrics']['iou_threshold']:.3f}"
+        f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f} @thr={fit['test_metrics']['iou_threshold']:.3f}, "
+        f"best_epoch={fit['best_epoch']}"
     )
 
     _save_artifacts(
@@ -1075,6 +1168,10 @@ def main() -> int:
         chip_size=fit["chip_size"],
         channel_names=fit["channel_names"],
         use_base_features=fit["use_base_features"],
+        best_epoch=fit["best_epoch"],
+        best_score=fit["best_score"],
+        early_stop_patience=fit["early_stop_patience"],
+        early_stop_min_delta=fit["early_stop_min_delta"],
     )
     return 0
 
