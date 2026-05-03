@@ -5,6 +5,7 @@ import argparse
 import os
 import random
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -383,6 +384,11 @@ def _binary_metrics(
     }
 
 
+def _sync_device_for_timing(device: str) -> None:
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _evaluate_in_batches(
     model: nn.Module,
     loss_fn: nn.Module,
@@ -398,6 +404,7 @@ def _evaluate_in_batches(
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
     total_loss = 0.0
     total_count = 0
+    inference_seconds = 0.0
     logits_cpu_parts: List[torch.Tensor] = []
     targets_cpu_parts: List[torch.Tensor] = []
 
@@ -406,7 +413,11 @@ def _evaluate_in_batches(
         for xb, yb in dl:
             xb = xb.to(device)
             yb = yb.to(device)
+            _sync_device_for_timing(device)
+            start_time = time.perf_counter()
             logits = model(xb)
+            _sync_device_for_timing(device)
+            inference_seconds += time.perf_counter() - start_time
             loss = loss_fn(logits, yb)
             total_loss += float(loss.item()) * xb.shape[0]
             total_count += xb.shape[0]
@@ -422,6 +433,9 @@ def _evaluate_in_batches(
         iou_threshold=iou_threshold,
         search_iou_threshold=search_iou_threshold,
     )
+    metrics["inference_ms_per_sample"] = float((inference_seconds / max(total_count, 1)) * 1000.0)
+    metrics["inference_total_seconds"] = float(inference_seconds)
+    metrics["inference_sample_count"] = int(total_count)
     details: Optional[Dict[str, torch.Tensor]] = None
     if collect_details:
         probs = torch.sigmoid(all_logits)
@@ -702,7 +716,8 @@ def train_model(
             f"train_iou_empty={train_metrics['iou_empty_truth_mean']:.4f} n={train_metrics['empty_truth_count']} | "
             f"test_iou_empty={test_metrics['iou_empty_truth_mean']:.4f} n={test_metrics['empty_truth_count']} | "
             f"train_iou_nonempty={train_metrics['iou_nonempty_truth_mean']:.4f} n={train_metrics['nonempty_truth_count']} | "
-            f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']}"
+            f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']} | "
+            f"test_infer_ms/sample={test_metrics['inference_ms_per_sample']:.3f}"
         )
 
         score = float(test_metrics["iou_mean"])
@@ -737,7 +752,8 @@ def train_model(
         f"train_eval_loss={best_train_eval_loss:.5f} | test_loss={best_test_loss:.5f} | "
         f"test_iou_mean={best_score:.4f} @thr={test_metrics['iou_threshold']:.3f} | "
         f"test_iou_empty={test_metrics['iou_empty_truth_mean']:.4f} n={test_metrics['empty_truth_count']} | "
-        f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']}"
+        f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']} | "
+        f"test_infer_ms/sample={test_metrics['inference_ms_per_sample']:.3f}"
     )
 
     _save_random_curtain_plots(
@@ -836,8 +852,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--feather-root", type=str, default=FEATHER_ROOT)
     parser.add_argument("--embedding-dir", type=str, default=EMBEDDING_DIR)
-    parser.add_argument("--train-files", type=int, default=100)
-    parser.add_argument("--test-files", type=int, default=10)
+    parser.add_argument("--train-files", type=int, default=1000)
+    parser.add_argument("--test-files", type=int, default=100)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=1024)
@@ -989,6 +1005,7 @@ def main() -> int:
         f"test_iou_empty={fit['test_metrics']['iou_empty_truth_mean']:.4f} n={fit['test_metrics']['empty_truth_count']}, "
         f"train_iou_nonempty={fit['train_metrics']['iou_nonempty_truth_mean']:.4f} n={fit['train_metrics']['nonempty_truth_count']}, "
         f"test_iou_nonempty={fit['test_metrics']['iou_nonempty_truth_mean']:.4f} n={fit['test_metrics']['nonempty_truth_count']}, "
+        f"test_infer_ms/sample={fit['test_metrics']['inference_ms_per_sample']:.3f}, "
         f"best_epoch={fit['best_epoch']}"
     )
 
