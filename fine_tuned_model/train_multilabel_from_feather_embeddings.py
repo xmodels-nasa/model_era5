@@ -323,6 +323,12 @@ def _sample_iou_mean(preds: torch.Tensor, targets: torch.Tensor) -> float:
     return float(_sample_iou_values(preds, targets).mean().item())
 
 
+def _sample_iou_group_mean(iou_values: torch.Tensor, mask: torch.Tensor) -> float:
+    if int(mask.sum().item()) == 0:
+        return float("nan")
+    return float(iou_values[mask].mean().item())
+
+
 def _find_best_iou_threshold(
     probs: torch.Tensor,
     targets: torch.Tensor,
@@ -359,13 +365,20 @@ def _binary_metrics(
         resolved_iou_threshold, iou_mean = _find_best_iou_threshold(probs, targets)
     else:
         resolved_iou_threshold = 0.5 if iou_threshold is None else float(iou_threshold)
-        iou_preds = (probs >= resolved_iou_threshold).float()
-        iou_mean = _sample_iou_mean(iou_preds, targets)
+    iou_preds = (probs >= resolved_iou_threshold).float()
+    iou_values = _sample_iou_values(iou_preds, targets)
+    iou_mean = float(iou_values.mean().item())
+    empty_truth_mask = targets.sum(dim=1) <= 0
+    nonempty_truth_mask = ~empty_truth_mask
     return {
         "accuracy": float(acc),
         "f1_macro": float(f1_macro),
         "auc_macro": float(auc_macro),
         "iou_mean": float(iou_mean),
+        "iou_empty_truth_mean": _sample_iou_group_mean(iou_values, empty_truth_mask),
+        "iou_nonempty_truth_mean": _sample_iou_group_mean(iou_values, nonempty_truth_mask),
+        "empty_truth_count": int(empty_truth_mask.sum().item()),
+        "nonempty_truth_count": int(nonempty_truth_mask.sum().item()),
         "iou_threshold": float(resolved_iou_threshold),
     }
 
@@ -685,7 +698,11 @@ def train_model(
             f"train_f1_macro={train_metrics['f1_macro']:.4f} | test_f1_macro={test_metrics['f1_macro']:.4f} | "
             f"train_auc_macro={train_metrics['auc_macro']:.4f} | test_auc_macro={test_metrics['auc_macro']:.4f} | "
             f"train_iou_mean={train_metrics['iou_mean']:.4f} @thr={train_metrics['iou_threshold']:.3f} | "
-            f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f}"
+            f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f} | "
+            f"train_iou_empty={train_metrics['iou_empty_truth_mean']:.4f} n={train_metrics['empty_truth_count']} | "
+            f"test_iou_empty={test_metrics['iou_empty_truth_mean']:.4f} n={test_metrics['empty_truth_count']} | "
+            f"train_iou_nonempty={train_metrics['iou_nonempty_truth_mean']:.4f} n={train_metrics['nonempty_truth_count']} | "
+            f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']}"
         )
 
         score = float(test_metrics["iou_mean"])
@@ -718,7 +735,9 @@ def train_model(
         "Using best epoch | "
         f"epoch={best_epoch:03d} | train_loss={best_train_loss:.5f} | "
         f"train_eval_loss={best_train_eval_loss:.5f} | test_loss={best_test_loss:.5f} | "
-        f"test_iou_mean={best_score:.4f} @thr={test_metrics['iou_threshold']:.3f}"
+        f"test_iou_mean={best_score:.4f} @thr={test_metrics['iou_threshold']:.3f} | "
+        f"test_iou_empty={test_metrics['iou_empty_truth_mean']:.4f} n={test_metrics['empty_truth_count']} | "
+        f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']}"
     )
 
     _save_random_curtain_plots(
@@ -966,6 +985,10 @@ def main() -> int:
         f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}, "
         f"train_iou_mean={fit['train_metrics']['iou_mean']:.4f} @thr={fit['train_metrics']['iou_threshold']:.3f}, "
         f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f} @thr={fit['test_metrics']['iou_threshold']:.3f}, "
+        f"train_iou_empty={fit['train_metrics']['iou_empty_truth_mean']:.4f} n={fit['train_metrics']['empty_truth_count']}, "
+        f"test_iou_empty={fit['test_metrics']['iou_empty_truth_mean']:.4f} n={fit['test_metrics']['empty_truth_count']}, "
+        f"train_iou_nonempty={fit['train_metrics']['iou_nonempty_truth_mean']:.4f} n={fit['train_metrics']['nonempty_truth_count']}, "
+        f"test_iou_nonempty={fit['test_metrics']['iou_nonempty_truth_mean']:.4f} n={fit['test_metrics']['nonempty_truth_count']}, "
         f"best_epoch={fit['best_epoch']}"
     )
 
