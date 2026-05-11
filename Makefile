@@ -51,7 +51,7 @@ baseline-train:
 	echo "Started baseline raw-chip training in background. PID=$$!"; \
 	echo "Log file: $$log_file"
 
-basline-train-aurora:
+baseline-train-aurora:
 	@mkdir -p "$(LOG_DIR)"
 	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
 	log_file="$(LOG_DIR)/train_multilable_from_rawchips_aurora_architecturer_$${timestamp}.log"; \
