@@ -1,4 +1,4 @@
-.PHONY: run ft ft-3x3 embedding raw-chips baseline-train
+.PHONY: run ft ft-3x3 embedding raw-chips baseline-train basline-train-aurora
 
 FT_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings.py
 FT_3X3_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings_3x3.py
@@ -6,6 +6,7 @@ FT_3X3_ARGS := --sample-ratio 0.5
 EMBEDDING_SCRIPT := fine_tuned_model/get_embedings_from_all_feather_files_3_by_3_grids.py
 RAW_CHIPS_SCRIPT := baseline_model/get_raw_chips_from_all_feather_files.py
 BASELINE_TRAIN_SCRIPT := baseline_model/train_multilabel_from_raw_chips.py
+BASELINE_AURORA_TRAIN_SCRIPT := baseline_model/train_multilable_from_rawchips_aurora_architecturer.py
 LOG_DIR := logs
 
 run: ft
@@ -48,4 +49,12 @@ baseline-train:
 	log_file="$(LOG_DIR)/train_multilabel_from_raw_chips_$${timestamp}.log"; \
 	PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(BASELINE_TRAIN_SCRIPT)" > "$$log_file" 2>&1 & \
 	echo "Started baseline raw-chip training in background. PID=$$!"; \
+	echo "Log file: $$log_file"
+
+basline-train-aurora:
+	@mkdir -p "$(LOG_DIR)"
+	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
+	log_file="$(LOG_DIR)/train_multilable_from_rawchips_aurora_architecturer_$${timestamp}.log"; \
+	PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(BASELINE_AURORA_TRAIN_SCRIPT)" > "$$log_file" 2>&1 & \
+	echo "Started Aurora-style baseline raw-chip training in background. PID=$$!"; \
 	echo "Log file: $$log_file"
