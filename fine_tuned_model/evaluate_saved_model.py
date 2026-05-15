@@ -166,11 +166,16 @@ def select_holdout_test_files(
     )
     validation_keys = {_file_key(m) for m in validation_selected}
     sorted_metas = sorted(metas, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path)))
+    post_cutoff_pool = [m for m in sorted_metas if m.file_time >= test_start_time]
     holdout_pool = [
         m
-        for m in sorted_metas
-        if m.file_time >= test_start_time and _file_key(m) not in validation_keys
+        for m in post_cutoff_pool
+        if _file_key(m) not in validation_keys
     ]
+    print(f"Files on/after cutoff: {len(post_cutoff_pool)}")
+    print(f"Validation files to exclude from post-cutoff pool: {len(validation_selected)}")
+    print(f"Remaining net-new holdout candidates: {len(holdout_pool)}")
+    print(f"Requested net-new holdout files: {test_files}")
     if len(holdout_pool) < test_files:
         raise ValueError(
             f"Not enough net-new holdout files on or after {test_start_time}. "
