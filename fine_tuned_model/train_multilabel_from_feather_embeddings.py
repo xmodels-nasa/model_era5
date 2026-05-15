@@ -166,27 +166,31 @@ def discover_files(feather_root: Path, embedding_dir: Path) -> List[FileMeta]:
     return metas
 
 
-def select_train_test_files(
+def select_train_validation_test_files(
     metas: Sequence[FileMeta],
     train_files: int,
+    validation_files: int,
     test_files: int,
     seed: int,
     test_start_time: pd.Timestamp,
-) -> Tuple[List[FileMeta], List[FileMeta]]:
-    if len(metas) < (train_files + test_files):
+) -> Tuple[List[FileMeta], List[FileMeta], List[FileMeta]]:
+    held_out_files = validation_files + test_files
+    if len(metas) < (train_files + held_out_files):
         raise ValueError(
-            f"Not enough files with embeddings: have {len(metas)}, need at least {train_files + test_files}."
+            f"Not enough files with embeddings: have {len(metas)}, need at least {train_files + held_out_files}."
         )
 
     rng = random.Random(seed)
     sorted_metas = sorted(metas, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path)))
-    test_pool = [m for m in sorted_metas if m.file_time >= test_start_time]
-    if len(test_pool) < test_files:
+    held_out_pool = [m for m in sorted_metas if m.file_time >= test_start_time]
+    if len(held_out_pool) < held_out_files:
         raise ValueError(
-            f"Not enough test files on or after {test_start_time}. "
-            f"Need {test_files}, but only found {len(test_pool)}."
+            f"Not enough validation/test files on or after {test_start_time}. "
+            f"Need {held_out_files}, but only found {len(held_out_pool)}."
         )
-    test_selected = rng.sample(test_pool, k=test_files)
+    held_out_selected = rng.sample(held_out_pool, k=held_out_files)
+    validation_selected = held_out_selected[:validation_files]
+    test_selected = held_out_selected[validation_files:]
 
     train_pool = [m for m in sorted_metas if m.file_time < test_start_time]
     if len(train_pool) < train_files:
@@ -197,8 +201,27 @@ def select_train_test_files(
     train_selected = rng.sample(train_pool, k=train_files)
     return (
         sorted(train_selected, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path))),
+        sorted(validation_selected, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path))),
         sorted(test_selected, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path))),
     )
+
+
+def select_train_test_files(
+    metas: Sequence[FileMeta],
+    train_files: int,
+    test_files: int,
+    seed: int,
+    test_start_time: pd.Timestamp,
+) -> Tuple[List[FileMeta], List[FileMeta]]:
+    train_selected, validation_selected, _ = select_train_validation_test_files(
+        metas=metas,
+        train_files=train_files,
+        validation_files=test_files,
+        test_files=0,
+        seed=seed,
+        test_start_time=test_start_time,
+    )
+    return train_selected, validation_selected
 
 
 def _load_one_file_arrays(
@@ -589,7 +612,7 @@ def _save_random_curtain_plots(
 
     if saved == 0:
         print(
-            f"Skipping {split_name} curtain plots because no test file had a contiguous "
+            f"Skipping {split_name} curtain plots because no {split_name} file had a contiguous "
             f"{curtain_rows}-row span available."
         )
     elif saved < num_random_plots:
@@ -599,9 +622,11 @@ def _save_random_curtain_plots(
 def train_model(
     x_train: np.ndarray,
     y_train: np.ndarray,
+    x_validation: np.ndarray,
+    y_validation: np.ndarray,
     x_test: np.ndarray,
     y_test: np.ndarray,
-    test_files: Sequence[FileMeta],
+    validation_files: Sequence[FileMeta],
     epochs: int,
     batch_size: int,
     eval_batch_size: int,
@@ -631,10 +656,13 @@ def train_model(
     x_std = np.where(x_std < 1e-6, 1.0, x_std)
 
     x_train_n = (x_train - x_mean) / x_std
+    x_validation_n = (x_validation - x_mean) / x_std
     x_test_n = (x_test - x_mean) / x_std
 
     x_train_t = torch.from_numpy(x_train_n.astype(np.float32))
     y_train_t = torch.from_numpy(y_train.astype(np.float32))
+    x_validation_t = torch.from_numpy(x_validation_n.astype(np.float32))
+    y_validation_t = torch.from_numpy(y_validation.astype(np.float32))
     x_test_t = torch.from_numpy(x_test_n.astype(np.float32))
     y_test_t = torch.from_numpy(y_test.astype(np.float32))
 
@@ -662,10 +690,10 @@ def train_model(
     best_score = float("-inf")
     best_state_dict: Optional[Dict[str, torch.Tensor]] = None
     best_train_metrics: Optional[Dict[str, float]] = None
-    best_test_metrics: Optional[Dict[str, float]] = None
+    best_validation_metrics: Optional[Dict[str, float]] = None
     best_train_loss = float("nan")
     best_train_eval_loss = float("nan")
-    best_test_loss = float("nan")
+    best_validation_loss = float("nan")
     epochs_without_improvement = 0
 
     for epoch in range(1, epochs + 1):
@@ -695,41 +723,41 @@ def train_model(
             device=device,
             search_iou_threshold=True,
         )
-        test_loss, test_metrics, _ = _evaluate_in_batches(
+        validation_loss, validation_metrics, _ = _evaluate_in_batches(
             model=model,
             loss_fn=loss_fn,
-            x=x_test_t,
-            y=y_test_t,
+            x=x_validation_t,
+            y=y_validation_t,
             batch_size=eval_batch_size,
             device=device,
-            iou_threshold=train_metrics["iou_threshold"],
+            search_iou_threshold=True,
         )
 
         print(
             f"Epoch {epoch:03d} | train_loss={train_loss:.5f} | train_eval_loss={train_eval_loss:.5f} | "
-            f"test_loss={test_loss:.5f} | "
-            f"train_acc={train_metrics['accuracy']:.4f} | test_acc={test_metrics['accuracy']:.4f} | "
-            f"train_f1_macro={train_metrics['f1_macro']:.4f} | test_f1_macro={test_metrics['f1_macro']:.4f} | "
-            f"train_auc_macro={train_metrics['auc_macro']:.4f} | test_auc_macro={test_metrics['auc_macro']:.4f} | "
+            f"validation_loss={validation_loss:.5f} | "
+            f"train_acc={train_metrics['accuracy']:.4f} | validation_acc={validation_metrics['accuracy']:.4f} | "
+            f"train_f1_macro={train_metrics['f1_macro']:.4f} | validation_f1_macro={validation_metrics['f1_macro']:.4f} | "
+            f"train_auc_macro={train_metrics['auc_macro']:.4f} | validation_auc_macro={validation_metrics['auc_macro']:.4f} | "
             f"train_iou_mean={train_metrics['iou_mean']:.4f} @thr={train_metrics['iou_threshold']:.3f} | "
-            f"test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f} | "
+            f"validation_iou_mean={validation_metrics['iou_mean']:.4f} @thr={validation_metrics['iou_threshold']:.3f} | "
             f"train_iou_empty={train_metrics['iou_empty_truth_mean']:.4f} n={train_metrics['empty_truth_count']} | "
-            f"test_iou_empty={test_metrics['iou_empty_truth_mean']:.4f} n={test_metrics['empty_truth_count']} | "
+            f"validation_iou_empty={validation_metrics['iou_empty_truth_mean']:.4f} n={validation_metrics['empty_truth_count']} | "
             f"train_iou_nonempty={train_metrics['iou_nonempty_truth_mean']:.4f} n={train_metrics['nonempty_truth_count']} | "
-            f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']} | "
-            f"test_infer_ms/sample={test_metrics['inference_ms_per_sample']:.3f}"
+            f"validation_iou_nonempty={validation_metrics['iou_nonempty_truth_mean']:.4f} n={validation_metrics['nonempty_truth_count']} | "
+            f"validation_infer_ms/sample={validation_metrics['inference_ms_per_sample']:.3f}"
         )
 
-        score = float(test_metrics["iou_mean"])
+        score = float(validation_metrics["iou_mean"])
         if score > best_score + early_stop_min_delta:
             best_epoch = epoch
             best_score = score
             best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best_train_metrics = dict(train_metrics)
-            best_test_metrics = dict(test_metrics)
+            best_validation_metrics = dict(validation_metrics)
             best_train_loss = float(train_loss)
             best_train_eval_loss = float(train_eval_loss)
-            best_test_loss = float(test_loss)
+            best_validation_loss = float(validation_loss)
             epochs_without_improvement = 0
             print(f"  New best validation IoU: {best_score:.4f} at epoch {best_epoch:03d}")
         else:
@@ -741,16 +769,26 @@ def train_model(
                 )
                 break
 
-    if best_state_dict is None or best_train_metrics is None or best_test_metrics is None:
+    if best_state_dict is None or best_train_metrics is None or best_validation_metrics is None:
         raise RuntimeError("Training finished without recording a best model state.")
     model.load_state_dict(best_state_dict)
     train_metrics = best_train_metrics
-    test_metrics = best_test_metrics
+    validation_metrics = best_validation_metrics
+    test_loss, test_metrics, _ = _evaluate_in_batches(
+        model=model,
+        loss_fn=loss_fn,
+        x=x_test_t,
+        y=y_test_t,
+        batch_size=eval_batch_size,
+        device=device,
+        iou_threshold=validation_metrics["iou_threshold"],
+    )
     print(
         "Using best epoch | "
         f"epoch={best_epoch:03d} | train_loss={best_train_loss:.5f} | "
-        f"train_eval_loss={best_train_eval_loss:.5f} | test_loss={best_test_loss:.5f} | "
-        f"test_iou_mean={best_score:.4f} @thr={test_metrics['iou_threshold']:.3f} | "
+        f"train_eval_loss={best_train_eval_loss:.5f} | validation_loss={best_validation_loss:.5f} | "
+        f"validation_iou_mean={best_score:.4f} @thr={validation_metrics['iou_threshold']:.3f} | "
+        f"test_loss={test_loss:.5f} | test_iou_mean={test_metrics['iou_mean']:.4f} @thr={test_metrics['iou_threshold']:.3f} | "
         f"test_iou_empty={test_metrics['iou_empty_truth_mean']:.4f} n={test_metrics['empty_truth_count']} | "
         f"test_iou_nonempty={test_metrics['iou_nonempty_truth_mean']:.4f} n={test_metrics['nonempty_truth_count']} | "
         f"test_infer_ms/sample={test_metrics['inference_ms_per_sample']:.3f}"
@@ -761,14 +799,14 @@ def train_model(
         split_name="validation",
         file_prefix=plot_file_prefix,
         model=model,
-        files=test_files,
+        files=validation_files,
         x_mean=x_mean,
         x_std=x_std,
         eval_batch_size=eval_batch_size,
         device=device,
         num_random_plots=plot_random_curtain_count,
         curtain_rows=plot_curtain_rows,
-        prediction_threshold=float(test_metrics["iou_threshold"]),
+        prediction_threshold=float(validation_metrics["iou_threshold"]),
         seed=seed,
     )
 
@@ -777,6 +815,7 @@ def train_model(
         "x_mean": x_mean.astype(np.float32),
         "x_std": x_std.astype(np.float32),
         "train_metrics": train_metrics,
+        "validation_metrics": validation_metrics,
         "test_metrics": test_metrics,
         "input_dim": int(x_train.shape[1]),
         "hidden_dims": list(resolved_hidden_dims),
@@ -794,8 +833,10 @@ def _save_artifacts(
     x_mean: np.ndarray,
     x_std: np.ndarray,
     train_files: Sequence[FileMeta],
+    validation_files: Sequence[FileMeta],
     test_files: Sequence[FileMeta],
     train_metrics: Dict[str, float],
+    validation_metrics: Dict[str, float],
     test_metrics: Dict[str, float],
     input_dim: int,
     hidden_dims: Sequence[int],
@@ -820,6 +861,7 @@ def _save_artifacts(
             "base_features": BASE_FEATURE_COLUMNS,
             "target_columns": TARGET_COLUMNS,
             "train_metrics": train_metrics,
+            "validation_metrics": validation_metrics,
             "test_metrics": test_metrics,
             "best_epoch": int(best_epoch),
             "best_score": float(best_score),
@@ -833,6 +875,8 @@ def _save_artifacts(
     rows = []
     for m in train_files:
         rows.append({"split": "train", "file": str(m.feather_path), "file_time_utc": str(m.file_time)})
+    for m in validation_files:
+        rows.append({"split": "validation", "file": str(m.feather_path), "file_time_utc": str(m.file_time)})
     for m in test_files:
         rows.append({"split": "test", "file": str(m.feather_path), "file_time_utc": str(m.file_time)})
     pd.DataFrame(rows).to_csv(split_path, index=False)
@@ -853,7 +897,8 @@ def main() -> int:
     parser.add_argument("--feather-root", type=str, default=FEATHER_ROOT)
     parser.add_argument("--embedding-dir", type=str, default=EMBEDDING_DIR)
     parser.add_argument("--train-files", type=int, default=1000)
-    parser.add_argument("--test-files", type=int, default=100)
+    parser.add_argument("--validation-files", type=int, default=50)
+    parser.add_argument("--test-files", type=int, default=50)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=1024)
@@ -892,7 +937,7 @@ def main() -> int:
         "--test-start-time",
         type=str,
         default=DEFAULT_TEST_START_TIME,
-        help="UTC timestamp cutoff for test-file eligibility. Files on or after this time are eligible for test.",
+        help="UTC timestamp cutoff for validation/test-file eligibility. Files on or after this time are eligible.",
     )
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--plot-dir", type=str, default=LOG_DIR)
@@ -937,22 +982,31 @@ def main() -> int:
 
     metas = discover_files(feather_root, embedding_dir)
     test_start_time = _parse_utc_timestamp(args.test_start_time)
-    train_files, test_files = select_train_test_files(
+    train_files, validation_files, test_files = select_train_validation_test_files(
         metas=metas,
         train_files=args.train_files,
+        validation_files=args.validation_files,
         test_files=args.test_files,
         seed=args.seed,
         test_start_time=test_start_time,
     )
     print(f"Selected train files: {len(train_files)}")
+    print(f"Selected validation files: {len(validation_files)}")
     print(f"Selected test files: {len(test_files)}")
     print(f"Test file cutoff:   {test_start_time}")
     print(f"Train max file_time: {max(m.file_time for m in train_files)}")
+    print(f"Validation min file_time: {min(m.file_time for m in validation_files)}")
     print(f"Test min file_time:  {min(m.file_time for m in test_files)}")
 
     max_samples_per_file = None if args.max_samples_per_file <= 0 else int(args.max_samples_per_file)
     x_train, y_train = load_dataset(
         train_files,
+        sample_ratio=args.sample_ratio,
+        max_samples_per_file=max_samples_per_file,
+        seed=args.seed,
+    )
+    x_validation, y_validation = load_dataset(
+        validation_files,
         sample_ratio=args.sample_ratio,
         max_samples_per_file=max_samples_per_file,
         seed=args.seed,
@@ -964,14 +1018,17 @@ def main() -> int:
         seed=args.seed,
     )
     print(f"Train samples: {x_train.shape[0]} | Feature dim: {x_train.shape[1]} | Targets: {y_train.shape[1]}")
+    print(f"Validation samples: {x_validation.shape[0]}")
     print(f"Test samples:  {x_test.shape[0]}")
 
     fit = train_model(
         x_train=x_train,
         y_train=y_train,
+        x_validation=x_validation,
+        y_validation=y_validation,
         x_test=x_test,
         y_test=y_test,
-        test_files=test_files,
+        validation_files=validation_files,
         epochs=args.epochs,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
@@ -994,16 +1051,22 @@ def main() -> int:
     print(
         "Final metrics | "
         f"train_acc={fit['train_metrics']['accuracy']:.4f}, "
+        f"validation_acc={fit['validation_metrics']['accuracy']:.4f}, "
         f"test_acc={fit['test_metrics']['accuracy']:.4f}, "
         f"train_f1_macro={fit['train_metrics']['f1_macro']:.4f}, "
+        f"validation_f1_macro={fit['validation_metrics']['f1_macro']:.4f}, "
         f"test_f1_macro={fit['test_metrics']['f1_macro']:.4f}, "
         f"train_auc_macro={fit['train_metrics']['auc_macro']:.4f}, "
+        f"validation_auc_macro={fit['validation_metrics']['auc_macro']:.4f}, "
         f"test_auc_macro={fit['test_metrics']['auc_macro']:.4f}, "
         f"train_iou_mean={fit['train_metrics']['iou_mean']:.4f} @thr={fit['train_metrics']['iou_threshold']:.3f}, "
+        f"validation_iou_mean={fit['validation_metrics']['iou_mean']:.4f} @thr={fit['validation_metrics']['iou_threshold']:.3f}, "
         f"test_iou_mean={fit['test_metrics']['iou_mean']:.4f} @thr={fit['test_metrics']['iou_threshold']:.3f}, "
         f"train_iou_empty={fit['train_metrics']['iou_empty_truth_mean']:.4f} n={fit['train_metrics']['empty_truth_count']}, "
+        f"validation_iou_empty={fit['validation_metrics']['iou_empty_truth_mean']:.4f} n={fit['validation_metrics']['empty_truth_count']}, "
         f"test_iou_empty={fit['test_metrics']['iou_empty_truth_mean']:.4f} n={fit['test_metrics']['empty_truth_count']}, "
         f"train_iou_nonempty={fit['train_metrics']['iou_nonempty_truth_mean']:.4f} n={fit['train_metrics']['nonempty_truth_count']}, "
+        f"validation_iou_nonempty={fit['validation_metrics']['iou_nonempty_truth_mean']:.4f} n={fit['validation_metrics']['nonempty_truth_count']}, "
         f"test_iou_nonempty={fit['test_metrics']['iou_nonempty_truth_mean']:.4f} n={fit['test_metrics']['nonempty_truth_count']}, "
         f"test_infer_ms/sample={fit['test_metrics']['inference_ms_per_sample']:.3f}, "
         f"best_epoch={fit['best_epoch']}"
@@ -1015,8 +1078,10 @@ def main() -> int:
         x_mean=fit["x_mean"],
         x_std=fit["x_std"],
         train_files=train_files,
+        validation_files=validation_files,
         test_files=test_files,
         train_metrics=fit["train_metrics"],
+        validation_metrics=fit["validation_metrics"],
         test_metrics=fit["test_metrics"],
         input_dim=fit["input_dim"],
         hidden_dims=fit["hidden_dims"],
