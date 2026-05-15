@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Evaluate a saved embedding MLP on the full seed-selected validation split."""
+"""Evaluate a saved embedding MLP on a net-new post-cutoff holdout split."""
 
 import argparse
 import csv
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -130,7 +131,7 @@ def _save_good_curtain_plots(
             for ax in axes[1:]:
                 ax.tick_params(axis="y", labelleft=False)
             fig.suptitle(
-                f"Validation cloud-mask curtain | {meta.feather_path.name} | "
+                f"Holdout test cloud-mask curtain | {meta.feather_path.name} | "
                 f"rows {int(row_window[0])}-{int(row_window[-1])} | mean IoU={score:.3f}",
                 fontsize=13,
             )
@@ -143,7 +144,48 @@ def _save_good_curtain_plots(
         print(f"Saved {saved} plot(s); requested {num_plots}.")
 
 
-def _write_split_manifest(path: Path, files: Sequence[train.FileMeta]) -> None:
+def _file_key(meta: train.FileMeta) -> str:
+    return str(meta.feather_path.resolve())
+
+
+def select_holdout_test_files(
+    metas: Sequence[train.FileMeta],
+    train_files: int,
+    validation_files: int,
+    test_files: int,
+    training_seed: int,
+    holdout_seed: int,
+    test_start_time,
+) -> Tuple[List[train.FileMeta], List[train.FileMeta]]:
+    _, validation_selected = train.select_train_test_files(
+        metas=metas,
+        train_files=train_files,
+        test_files=validation_files,
+        seed=training_seed,
+        test_start_time=test_start_time,
+    )
+    validation_keys = {_file_key(m) for m in validation_selected}
+    sorted_metas = sorted(metas, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path)))
+    holdout_pool = [
+        m
+        for m in sorted_metas
+        if m.file_time >= test_start_time and _file_key(m) not in validation_keys
+    ]
+    if len(holdout_pool) < test_files:
+        raise ValueError(
+            f"Not enough net-new holdout files on or after {test_start_time}. "
+            f"Need {test_files}, found {len(holdout_pool)} after excluding "
+            f"{len(validation_selected)} validation files."
+        )
+    rng = random.Random(holdout_seed)
+    holdout_selected = rng.sample(holdout_pool, k=test_files)
+    return (
+        sorted(validation_selected, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path))),
+        sorted(holdout_selected, key=lambda x: (x.file_time, str(x.feather_path), str(x.npz_path))),
+    )
+
+
+def _write_split_manifest(path: Path, split_name: str, files: Sequence[train.FileMeta]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["split", "file", "npz", "file_time_utc"])
@@ -151,12 +193,44 @@ def _write_split_manifest(path: Path, files: Sequence[train.FileMeta]) -> None:
         for meta in files:
             writer.writerow(
                 {
-                    "split": "validation",
+                    "split": split_name,
                     "file": str(meta.feather_path),
                     "npz": str(meta.npz_path),
                     "file_time_utc": str(meta.file_time),
                 }
             )
+
+
+def _format_metrics_text(
+    loss: float,
+    metrics: Dict[str, object],
+    test_files: Sequence[train.FileMeta],
+    validation_files: Sequence[train.FileMeta],
+    test_start_time,
+    training_seed: int,
+    holdout_seed: int,
+) -> str:
+    validation_keys = {_file_key(m) for m in validation_files}
+    holdout_keys = {_file_key(m) for m in test_files}
+    lines = [
+        "Holdout test metrics",
+        f"test_start_time_utc={test_start_time}",
+        f"training_seed={training_seed}",
+        f"holdout_seed={holdout_seed}",
+        f"holdout_file_count={len(test_files)}",
+        f"excluded_validation_file_count={len(validation_files)}",
+        f"validation_holdout_overlap_count={len(validation_keys & holdout_keys)}",
+        f"holdout_min_file_time_utc={min(m.file_time for m in test_files)}",
+        f"holdout_max_file_time_utc={max(m.file_time for m in test_files)}",
+        f"loss={loss:.8f}",
+    ]
+    for key in sorted(metrics):
+        value = metrics[key]
+        if isinstance(value, float):
+            lines.append(f"{key}={value:.8f}")
+        else:
+            lines.append(f"{key}={value}")
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:
@@ -165,8 +239,10 @@ def main() -> int:
     parser.add_argument("--feather-root", type=str, default=train.FEATHER_ROOT)
     parser.add_argument("--embedding-dir", type=str, default=train.EMBEDDING_DIR)
     parser.add_argument("--train-files", type=int, default=1000)
+    parser.add_argument("--validation-files", type=int, default=100)
     parser.add_argument("--test-files", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--holdout-seed", type=int, default=None)
     parser.add_argument("--test-start-time", type=str, default=train.DEFAULT_TEST_START_TIME)
     parser.add_argument("--eval-batch-size", type=int, default=1024)
     parser.add_argument("--iou-threshold", type=float, default=None)
@@ -194,13 +270,22 @@ def main() -> int:
     model.eval()
 
     metas = train.discover_files(Path(args.feather_root), Path(args.embedding_dir))
-    _, test_files = train.select_train_test_files(
+    test_start_time = train._parse_utc_timestamp(args.test_start_time)
+    holdout_seed = args.holdout_seed if args.holdout_seed is not None else args.seed + 1
+    validation_files, test_files = select_holdout_test_files(
         metas=metas,
         train_files=args.train_files,
+        validation_files=args.validation_files,
         test_files=args.test_files,
-        seed=args.seed,
-        test_start_time=train._parse_utc_timestamp(args.test_start_time),
+        training_seed=args.seed,
+        holdout_seed=holdout_seed,
+        test_start_time=test_start_time,
     )
+    print(f"Excluded validation files: {len(validation_files)}")
+    print(f"Selected net-new test files: {len(test_files)}")
+    print(f"Test file cutoff: {test_start_time}")
+    print(f"Net-new test min file_time: {min(m.file_time for m in test_files)}")
+    print(f"Net-new test max file_time: {max(m.file_time for m in test_files)}")
 
     x_test, y_test = train.load_dataset(test_files, sample_ratio=1.0, max_samples_per_file=None, seed=args.seed)
     x_test = (x_test - x_mean) / x_std
@@ -219,7 +304,7 @@ def main() -> int:
     )
 
     print(
-        "Validation metrics | "
+        "Holdout test metrics | "
         f"loss={loss:.5f}, samples={metrics['inference_sample_count']}, "
         f"iou_mean={metrics['iou_mean']:.4f} @thr={metrics['iou_threshold']:.3f}, "
         f"iou_empty={metrics['iou_empty_truth_mean']:.4f} n={metrics['empty_truth_count']}, "
@@ -228,7 +313,22 @@ def main() -> int:
     )
 
     plot_dir = out_dir / "plots"
-    _write_split_manifest(plot_dir / "validation_file_split.csv", test_files)
+    metrics_path = out_dir / "metrics.txt"
+    metrics_path.write_text(
+        _format_metrics_text(
+            loss=loss,
+            metrics=metrics,
+            test_files=test_files,
+            validation_files=validation_files,
+            test_start_time=test_start_time,
+            training_seed=args.seed,
+            holdout_seed=holdout_seed,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Saved metrics: {metrics_path}")
+    _write_split_manifest(plot_dir / "excluded_validation_file_split.csv", "excluded_validation", validation_files)
+    _write_split_manifest(plot_dir / "holdout_test_file_split.csv", "holdout_test", test_files)
     _save_good_curtain_plots(
         out_dir=plot_dir,
         model=model,
