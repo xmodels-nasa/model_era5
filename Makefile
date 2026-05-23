@@ -1,10 +1,11 @@
-.PHONY: run ft ft-forecast ft-3x3 embedding raw-chips baseline-train basline-train-aurora
+.PHONY: run ft ft-forecast ft-3x3 embedding embedding-forecast raw-chips baseline-train basline-train-aurora
 
 FT_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings.py
 FT_FORECAST_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings_forecast.py
 FT_3X3_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings_3x3.py
 FT_3X3_ARGS := --sample-ratio 0.5
 EMBEDDING_SCRIPT := fine_tuned_model/get_embedings_from_all_feather_files_3_by_3_grids.py
+EMBEDDING_FORECAST_SCRIPT := fine_tuned_model/get_embedings_from_all_feather_files_forecast.py
 RAW_CHIPS_SCRIPT := baseline_model/get_raw_chips_from_all_feather_files.py
 BASELINE_TRAIN_SCRIPT := baseline_model/train_multilabel_from_raw_chips.py
 BASELINE_AURORA_TRAIN_SCRIPT := baseline_model/train_multilable_from_rawchips_aurora_architecturer.py
@@ -42,6 +43,14 @@ embedding:
 	log_file="$(LOG_DIR)/get_embeddings_3x3_$${timestamp}.log"; \
 	PYTHONUNBUFFERED=1 nohup python3 -u "$(EMBEDDING_SCRIPT)" > "$$log_file" 2>&1 & \
 	echo "Started 3x3 embedding extraction in background. PID=$$!"; \
+	echo "Log file: $$log_file"
+
+embedding-forecast:
+	@mkdir -p "$(LOG_DIR)"
+	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
+	log_file="$(LOG_DIR)/get_embeddings_forecast_$${timestamp}.log"; \
+	PYTHONUNBUFFERED=1 nohup python3 -u "$(EMBEDDING_FORECAST_SCRIPT)" > "$$log_file" 2>&1 & \
+	echo "Started forecast embedding extraction in background. PID=$$!"; \
 	echo "Log file: $$log_file"
 
 raw-chips:
