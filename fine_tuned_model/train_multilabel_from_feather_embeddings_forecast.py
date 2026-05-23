@@ -45,6 +45,8 @@ class SourceIndex:
 _FORECAST_SOURCE_INDEX: Optional[SourceIndex] = None
 _FORECAST_LAG_HOURS = 6
 _FORECAST_BASE_FEATURE_SOURCE = "source"
+_SPATIAL_BIN_DEGREES = 0.25
+_SPATIAL_DECIMALS = 6
 
 
 def _timestamp_unit_from_series(values: pd.Series) -> str:
@@ -66,9 +68,20 @@ def _hour_key(hours: pd.Series) -> np.ndarray:
     return hours.astype("int64").to_numpy(copy=False)
 
 
-def _lat_lon_keys(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    lat = np.round(df["Latitude_0"].to_numpy(dtype=np.float64, copy=False), 6)
-    lon = np.round(df["Longitude_0"].to_numpy(dtype=np.float64, copy=False), 6)
+def _normalize_lon(lon: np.ndarray) -> np.ndarray:
+    return ((lon + 180.0) % 360.0) - 180.0
+
+
+def _spatial_keys(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    lat = df["Latitude_0"].to_numpy(dtype=np.float64, copy=False)
+    lon = _normalize_lon(df["Longitude_0"].to_numpy(dtype=np.float64, copy=False))
+    if _SPATIAL_BIN_DEGREES > 0:
+        lat = np.round(lat / _SPATIAL_BIN_DEGREES).astype(np.int64)
+        lon = np.round(lon / _SPATIAL_BIN_DEGREES).astype(np.int64)
+        return lat, lon
+
+    lat = np.round(lat, _SPATIAL_DECIMALS)
+    lon = np.round(lon, _SPATIAL_DECIMALS)
     return lat, lon
 
 
@@ -108,7 +121,7 @@ def build_source_index(files: Sequence[base.FileMeta]) -> SourceIndex:
         source_embedding_count += int(rows.size)
         source_df = df.iloc[rows].reset_index(drop=True)
         hours = _hour_key(_rounded_hours(source_df["timestamp_0"]))
-        lat_keys, lon_keys = _lat_lon_keys(source_df)
+        lat_keys, lon_keys = _spatial_keys(source_df)
         base_values = source_df[base.BASE_FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=True)
 
         for emb_index, source_row, hour_ns, lat_key, lon_key, base_row in zip(
@@ -177,7 +190,7 @@ def _load_forecast_one_file_arrays(
     target_hours = _rounded_hours(df["timestamp_0"])
     source_hours = target_hours - pd.Timedelta(hours=_FORECAST_LAG_HOURS)
     hour_keys = _hour_key(source_hours)
-    lat_keys, lon_keys = _lat_lon_keys(df)
+    lat_keys, lon_keys = _spatial_keys(df)
 
     target_rows: List[int] = []
     refs: List[SourceRef] = []
@@ -228,6 +241,7 @@ def load_forecast_dataset(
     x_parts: List[np.ndarray] = []
     y_parts: List[np.ndarray] = []
     matched_files = 0
+    total_matched_rows = 0
     for file_idx, meta in enumerate(files):
         x, y, _ = _load_forecast_one_file_arrays(
             meta,
@@ -238,12 +252,19 @@ def load_forecast_dataset(
         if x.size == 0:
             continue
         matched_files += 1
+        total_matched_rows += int(x.shape[0])
         x_parts.append(x)
         y_parts.append(y)
 
     if not x_parts:
-        raise ValueError("No forecast samples available after matching target rows to lagged embeddings.")
-    print(f"Forecast matched files with samples: {matched_files}/{len(files)}")
+        raise ValueError(
+            "No forecast samples available after matching target rows to lagged embeddings. "
+            "Try a larger --spatial-bin-degrees, for example 0.5 or 1.0."
+        )
+    print(
+        f"Forecast matched files with samples: {matched_files}/{len(files)} | "
+        f"matched rows after sampling: {total_matched_rows}"
+    )
     return np.concatenate(x_parts, axis=0), np.concatenate(y_parts, axis=0)
 
 
@@ -253,6 +274,8 @@ def _save_forecast_config(
     forecast_lag_hours: int,
     base_feature_source: str,
     source_pool: str,
+    spatial_bin_degrees: float,
+    spatial_decimals: int,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     config_path = out_dir / "forecast_training_config.json"
@@ -264,6 +287,8 @@ def _save_forecast_config(
             "target_rounded_hour - forecast_lag_hours",
         ],
         "base_feature_source": base_feature_source,
+        "spatial_bin_degrees": float(spatial_bin_degrees),
+        "spatial_decimals": int(spatial_decimals),
         "source_pool": source_pool,
         "source_file_count": int(source_index.source_file_count),
         "source_embedding_count": int(source_index.source_embedding_count),
@@ -374,6 +399,21 @@ def main() -> int:
         default=0,
         help="Optional cap on source files used to build the lookup index. 0 means no cap.",
     )
+    parser.add_argument(
+        "--spatial-bin-degrees",
+        type=float,
+        default=0.25,
+        help=(
+            "Spatial bin size for matching lagged embeddings to target rows. "
+            "Default 0.25 approximates ERA5 grid cells. Use 0 for exact rounded lat/lon matching."
+        ),
+    )
+    parser.add_argument(
+        "--spatial-decimals",
+        type=int,
+        default=6,
+        help="Lat/lon decimals used only when --spatial-bin-degrees is 0.",
+    )
     args = parser.parse_args()
 
     if not args.feather_root:
@@ -386,6 +426,10 @@ def main() -> int:
         raise ValueError("--early-stop-min-delta must be >= 0.")
     if args.forecast_lag_hours <= 0:
         raise ValueError("--forecast-lag-hours must be > 0.")
+    if args.spatial_bin_degrees < 0:
+        raise ValueError("--spatial-bin-degrees must be >= 0.")
+    if args.spatial_decimals < 0:
+        raise ValueError("--spatial-decimals must be >= 0.")
 
     feather_root = Path(args.feather_root)
     embedding_dir = Path(args.embedding_dir)
@@ -421,11 +465,17 @@ def main() -> int:
     print(f"Forecast lag hours: {args.forecast_lag_hours}")
     print(f"Forecast source pool: {args.source_pool} ({len(source_files)} file(s))")
     print(f"Base feature source: {args.base_feature_source}")
+    if args.spatial_bin_degrees > 0:
+        print(f"Spatial match bins: {args.spatial_bin_degrees:g} degree(s)")
+    else:
+        print(f"Spatial match bins: exact rounded lat/lon ({args.spatial_decimals} decimals)")
 
-    global _FORECAST_SOURCE_INDEX, _FORECAST_LAG_HOURS, _FORECAST_BASE_FEATURE_SOURCE
-    _FORECAST_SOURCE_INDEX = build_source_index(source_files)
+    global _FORECAST_SOURCE_INDEX, _FORECAST_LAG_HOURS, _FORECAST_BASE_FEATURE_SOURCE, _SPATIAL_BIN_DEGREES, _SPATIAL_DECIMALS
     _FORECAST_LAG_HOURS = int(args.forecast_lag_hours)
     _FORECAST_BASE_FEATURE_SOURCE = args.base_feature_source
+    _SPATIAL_BIN_DEGREES = float(args.spatial_bin_degrees)
+    _SPATIAL_DECIMALS = int(args.spatial_decimals)
+    _FORECAST_SOURCE_INDEX = build_source_index(source_files)
     base._load_one_file_arrays = _load_forecast_one_file_arrays
 
     print(
@@ -522,6 +572,8 @@ def main() -> int:
         forecast_lag_hours=args.forecast_lag_hours,
         base_feature_source=args.base_feature_source,
         source_pool=args.source_pool,
+        spatial_bin_degrees=args.spatial_bin_degrees,
+        spatial_decimals=args.spatial_decimals,
     )
     return 0
 
