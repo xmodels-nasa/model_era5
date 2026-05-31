@@ -5,7 +5,8 @@ This is the first baseline step for end-to-end training from raw ERA5 fields
 instead of Aurora embeddings. For each Feather row, the script:
 
 1. Rounds the row timestamp to the same target hour used in the embedding flow.
-2. Loads the ERA5 pair for `(target-6h, target)`.
+2. Loads the ERA5 pair for `(target-6h, target)`, or for
+   `(target-lead-6h, target-lead)` when forecast mode is enabled.
 3. Extracts a centered spatial chip around the nearest ERA5 grid point.
 4. Saves dynamic inputs, static inputs, labels, and row metadata to one `.npz`.
 
@@ -61,6 +62,7 @@ _load_dotenv()
 DATA_ROOT = os.getenv("DATA_ROOT", str(PROJECT_ROOT / "data_era5"))
 FEATHER_FILE = os.getenv("FEATHER_FILE", "")
 RAW_CHIPS_DIR = os.getenv("RAW_CHIPS_DIR", str(PROJECT_ROOT / "raw_chips"))
+FORECAST_LEAD_HOURS = int(os.getenv("FORECAST_LEAD_HOURS", "6"))
 
 SURFACE_VARS = ("t2m", "u10", "v10", "msl")
 STATIC_VARS = ("z", "lsm", "slt")
@@ -87,6 +89,16 @@ def _build_target_column(df: pd.DataFrame) -> pd.Series:
     round_up = (df_dt - hour_floor) > pd.Timedelta(minutes=30)
     rounded_hour = hour_floor + pd.to_timedelta(round_up.astype(int), unit="h")
     return rounded_hour.dt.strftime("%Y_%m_%d_%H")
+
+
+def _format_target_hours(hours: pd.Series) -> pd.Series:
+    return hours.dt.strftime("%Y_%m_%d_%H")
+
+
+def _shift_target_column(targets: pd.Series, lead_hours: int) -> pd.Series:
+    target_dt = pd.to_datetime(targets, format="%Y_%m_%d_%H", utc=True)
+    source_dt = target_dt - pd.Timedelta(hours=lead_hours)
+    return _format_target_hours(source_dt)
 
 
 def parse_target(ts: str) -> datetime:
@@ -253,9 +265,12 @@ def process_feather_to_raw_chips(
     output_dtype: str,
     max_estimated_gb: float,
     overwrite: bool,
+    forecast_lead_hours: int = 0,
 ) -> Dict[str, object]:
     if chip_size <= 0:
         raise ValueError("chip_size must be positive.")
+    if forecast_lead_hours < 0:
+        raise ValueError("forecast_lead_hours must be >= 0.")
 
     output_dtype_np = np.float16 if output_dtype == "float16" else np.float32
     output_file = output_dir / f"{_safe_stem(feather_path)}.npz"
@@ -293,6 +308,10 @@ def process_feather_to_raw_chips(
 
     df = df.reset_index().rename(columns={"index": "source_row"})
     df["target"] = _build_target_column(df)
+    if forecast_lead_hours > 0:
+        df["context_target"] = _shift_target_column(df["target"], lead_hours=forecast_lead_hours)
+    else:
+        df["context_target"] = df["target"]
 
     if not (0 < sample_ratio <= 1.0):
         raise ValueError("sample_ratio must be in (0, 1].")
@@ -305,7 +324,7 @@ def process_feather_to_raw_chips(
 
     preview: Optional[Dict[str, np.ndarray]] = None
     preview_target: Optional[str] = None
-    for candidate_target in df["target"].drop_duplicates().tolist():
+    for candidate_target in df["context_target"].drop_duplicates().tolist():
         try:
             preview = load_era5_pair_as_tensors(data_root=data_root, target=str(candidate_target))
             preview_target = str(candidate_target)
@@ -313,8 +332,10 @@ def process_feather_to_raw_chips(
         except FileNotFoundError:
             continue
     if preview is None or preview_target is None:
+        context_note = "forecast source hour" if forecast_lead_hours > 0 else "target hour"
         raise FileNotFoundError(
-            f"No available ERA5 (t-6h, t) input pairs were found for any target hour referenced by {feather_path.name}."
+            f"No available ERA5 (t-6h, t) input pairs were found for any {context_note} "
+            f"referenced by {feather_path.name}."
         )
 
     estimated_bytes = _estimate_output_bytes(
@@ -342,27 +363,28 @@ def process_feather_to_raw_chips(
     matched_longitudes: List[float] = []
     timestamps: List[float] = []
     target_hours: List[str] = []
+    forecast_source_hours: List[str] = []
     input_times_unix_s: List[np.ndarray] = []
     rows_failed = 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    grouped = df.groupby("target", sort=True)
+    grouped = df.groupby("context_target", sort=True)
     context_cache: Dict[str, Dict[str, np.ndarray]] = {preview_target: preview}
-    for target, group in grouped:
-        if target in context_cache:
-            context = context_cache[target]
+    for context_target, group in grouped:
+        if context_target in context_cache:
+            context = context_cache[context_target]
         else:
             try:
-                context = load_era5_pair_as_tensors(data_root=data_root, target=target)
+                context = load_era5_pair_as_tensors(data_root=data_root, target=context_target)
             except FileNotFoundError as exc:
                 rows_failed += int(len(group))
                 print(
-                    f"[WARN] Skipping target={target} for {feather_path.name}: "
+                    f"[WARN] Skipping context_target={context_target} for {feather_path.name}: "
                     f"{len(group)} row(s) skipped because ERA5 inputs are missing. {exc}"
                 )
                 continue
-            context_cache[target] = context
+            context_cache[context_target] = context
 
         lat_vec = context["lat"]
         lon_vec = context["lon"]
@@ -393,7 +415,8 @@ def process_feather_to_raw_chips(
             matched_latitudes.append(float(lat_vec[lat_idx]))
             matched_longitudes.append(float(lon_vec[lon_idx]))
             timestamps.append(float(row["timestamp_0"]))
-            target_hours.append(str(target))
+            target_hours.append(str(row["target"]))
+            forecast_source_hours.append(str(context_target))
             input_times_unix_s.append(context["input_times_unix_s"])
 
     if dynamic_chips:
@@ -409,6 +432,8 @@ def process_feather_to_raw_chips(
             matched_longitudes=np.asarray(matched_longitudes, dtype=np.float32),
             timestamps=np.asarray(timestamps, dtype=np.float64),
             target_hours=np.asarray(target_hours, dtype="<U16"),
+            forecast_source_hours=np.asarray(forecast_source_hours, dtype="<U16"),
+            forecast_lead_hours=np.asarray(forecast_lead_hours, dtype=np.int64),
             input_times_unix_s=np.stack(input_times_unix_s, axis=0).astype(np.int64, copy=False),
             pressure_levels=preview["pressure_levels"],
             dynamic_channel_names=preview["dynamic_channel_names"],
@@ -429,6 +454,8 @@ def process_feather_to_raw_chips(
             matched_longitudes=np.empty((0,), dtype=np.float32),
             timestamps=np.empty((0,), dtype=np.float64),
             target_hours=np.empty((0,), dtype="<U16"),
+            forecast_source_hours=np.empty((0,), dtype="<U16"),
+            forecast_lead_hours=np.asarray(forecast_lead_hours, dtype=np.int64),
             input_times_unix_s=np.empty((0, 2), dtype=np.int64),
             pressure_levels=preview["pressure_levels"],
             dynamic_channel_names=preview["dynamic_channel_names"],
@@ -445,6 +472,7 @@ def process_feather_to_raw_chips(
         "rows_failed": int(rows_failed),
         "status": "ok",
         "estimated_gb": float(estimated_gb),
+        "forecast_lead_hours": int(forecast_lead_hours),
     }
 
 
@@ -479,6 +507,15 @@ def main() -> Dict[str, object]:
         help="Fail early if the estimated output for one Feather file exceeds this size.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--forecast-lead-hours",
+        type=int,
+        default=0,
+        help=(
+            "Forecast lead in hours. 0 keeps ground-truth-time inputs. "
+            f"Use {FORECAST_LEAD_HOURS} for the standard forecast setup."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.feather_file:
@@ -497,6 +534,7 @@ def main() -> Dict[str, object]:
         output_dtype=args.output_dtype,
         max_estimated_gb=args.max_estimated_gb,
         overwrite=args.overwrite,
+        forecast_lead_hours=args.forecast_lead_hours,
     )
     print(
         f"[DONE] {Path(summary['file']).name}: "
