@@ -17,7 +17,8 @@ raw_chips/
 
 # Runtime logs
 logs/
-results/
+results*/
+.matplotlib/
 
 #report doc
 report*
