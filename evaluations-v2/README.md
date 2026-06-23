@@ -1,6 +1,6 @@
 # evaluations-v2
 
-Validation-only evaluators for the four `results-v2` models. These scripts load saved checkpoints and split manifests; they do not retrain models.
+Test-set evaluators for the four `results-v2` models. These scripts load saved checkpoints and split manifests; they do not retrain models. The default split is `test`.
 
 ## Metrics
 
@@ -38,8 +38,8 @@ python evaluations-v2/evaluate_transformer_validation_metrics.py
 Each script writes:
 
 ```text
-results-v2/<model_output_dir>/validation_distance_iou_metrics.json
-results-v2/<model_output_dir>/validation_distance_iou_metrics.csv
+results-v2/<model_output_dir>/test_distance_iou_metrics.json
+results-v2/<model_output_dir>/test_distance_iou_metrics.csv
 ```
 
 ## Data Paths
@@ -50,7 +50,7 @@ By default, paths come from `.env`:
 - `RAW_CHIPS_DIR`
 - `EMBEDDING_OUTUT_DIR` or `EMBEDDING_OUTPUT_DIR`
 
-If the validation files are somewhere else, override them:
+If the test files are somewhere else, override them:
 
 ```bash
 python evaluations-v2/evaluate_baseline_validation_metrics.py \
@@ -67,6 +67,7 @@ Useful optional flags:
 ```text
 --device cpu
 --batch-size 4096
+--split validation
 --threshold 0.83
 --output-json /path/to/metrics.json
 ```

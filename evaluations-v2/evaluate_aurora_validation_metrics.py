@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate Aurora-style raw-chip validation distance-aware IoU metrics."""
+"""Evaluate Aurora-style raw-chip distance-aware IoU metrics."""
 
 from distance_metrics_common import EvalConfig, RESULTS_DIR, run
 

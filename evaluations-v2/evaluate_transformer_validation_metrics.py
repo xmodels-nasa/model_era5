@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate fine-tuned embedding Transformer validation distance-aware IoU metrics."""
+"""Evaluate fine-tuned embedding Transformer distance-aware IoU metrics."""
 
 from distance_metrics_common import EvalConfig, RESULTS_DIR, run
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validation evaluators and distance-aware metrics for 40-bin cloud masks."""
+"""Saved-model evaluators and distance-aware metrics for 40-bin cloud masks."""
 
 from __future__ import annotations
 
@@ -62,17 +62,17 @@ def _path_by_stem(root: Path, suffix: str) -> Dict[str, Path]:
     return {p.stem: p for p in root.glob(f"*{suffix}") if p.is_file()}
 
 
-def _validation_rows(split_path: Path) -> List[Dict[str, str]]:
+def _split_rows(split_path: Path, split_name: str) -> List[Dict[str, str]]:
     if not split_path.is_file():
         raise FileNotFoundError(f"Missing split manifest: {split_path}")
     rows: List[Dict[str, str]] = []
     with split_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row.get("split") == "validation":
+            if row.get("split") == split_name:
                 rows.append(row)
     if not rows:
-        raise ValueError(f"No validation rows found in {split_path}")
+        raise ValueError(f"No {split_name} rows found in {split_path}")
     return rows
 
 
@@ -85,6 +85,7 @@ def _timestamp(value: str) -> pd.Timestamp:
 
 def raw_validation_files(
     split_path: Path,
+    split_name: str,
     feather_root: Path,
     raw_chips_dir: Path,
 ) -> List[raw_train.FileMeta]:
@@ -92,7 +93,7 @@ def raw_validation_files(
     chips = _path_by_stem(raw_chips_dir, ".npz")
     metas: List[raw_train.FileMeta] = []
     missing: List[str] = []
-    for row in _validation_rows(split_path):
+    for row in _split_rows(split_path, split_name):
         stem = Path(row["file"]).stem
         manifest_feather = Path(row["file"])
         manifest_npz = Path(row.get("npz", ""))
@@ -111,7 +112,7 @@ def raw_validation_files(
     if missing:
         preview = ", ".join(missing[:5])
         raise FileNotFoundError(
-            f"Could not resolve {len(missing)} validation file(s) locally. "
+            f"Could not resolve {len(missing)} {split_name} file(s) locally. "
             f"First missing stems: {preview}. "
             f"Searched feather_root={feather_root} and raw_chips_dir={raw_chips_dir}; "
             "also tried absolute paths from the split manifest."
@@ -121,6 +122,7 @@ def raw_validation_files(
 
 def embedding_validation_files(
     split_path: Path,
+    split_name: str,
     feather_root: Path,
     embedding_dir: Path,
 ) -> List[emb_train.FileMeta]:
@@ -128,7 +130,7 @@ def embedding_validation_files(
     embeddings = _path_by_stem(embedding_dir, ".npz")
     metas: List[emb_train.FileMeta] = []
     missing: List[str] = []
-    for row in _validation_rows(split_path):
+    for row in _split_rows(split_path, split_name):
         stem = Path(row["file"]).stem
         manifest_feather = Path(row["file"])
         feather_path = manifest_feather if manifest_feather.is_file() else feathers.get(stem)
@@ -146,7 +148,7 @@ def embedding_validation_files(
     if missing:
         preview = ", ".join(missing[:5])
         raise FileNotFoundError(
-            f"Could not resolve {len(missing)} validation file(s) locally. "
+            f"Could not resolve {len(missing)} {split_name} file(s) locally. "
             f"First missing stems: {preview}. "
             f"Searched feather_root={feather_root} and embedding_dir={embedding_dir}; "
             "also tried absolute Feather paths from the split manifest."
@@ -257,9 +259,12 @@ def extended_iou_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, An
     return summary
 
 
-def saved_validation_threshold(ckpt: Dict[str, Any], override: Optional[float]) -> float:
+def saved_threshold(ckpt: Dict[str, Any], split_name: str, override: Optional[float]) -> float:
     if override is not None:
         return float(override)
+    split_metrics = ckpt.get(f"{split_name}_metrics")
+    if isinstance(split_metrics, dict) and split_metrics.get("iou_threshold") is not None:
+        return float(split_metrics["iou_threshold"])
     validation_metrics = ckpt.get("validation_metrics")
     if isinstance(validation_metrics, dict) and validation_metrics.get("iou_threshold") is not None:
         return float(validation_metrics["iou_threshold"])
@@ -294,7 +299,8 @@ def _print_summary(metrics: Dict[str, Any]) -> None:
         "distance_weighted_iou_sigma_2_nonempty_truth_mean",
     ]
     print(f"Model: {metrics['model_name']}")
-    print(f"Validation samples: {metrics['sample_count']}")
+    print(f"Split: {metrics['split']}")
+    print(f"Samples: {metrics['sample_count']}")
     for key in keys:
         print(f"{key}={metrics[key]:.6f}")
 
@@ -317,8 +323,8 @@ def evaluate_raw_unet(args: argparse.Namespace, config: EvalConfig) -> Dict[str,
         dropout=float(ckpt.get("dropout", 0.2)),
     ).to(args.device)
     model.load_state_dict(ckpt["model_state_dict"])
-    threshold = saved_validation_threshold(ckpt, args.threshold)
-    files = raw_validation_files(args.split_path, args.feather_root, args.raw_chips_dir)
+    threshold = saved_threshold(ckpt, args.split, args.threshold)
+    files = raw_validation_files(args.split_path, args.split, args.feather_root, args.raw_chips_dir)
     _, base_metrics, details = raw_train._evaluate_files(
         model=model,
         loss_fn=nn.BCEWithLogitsLoss(),
@@ -365,8 +371,8 @@ def evaluate_raw_aurora(args: argparse.Namespace, config: EvalConfig) -> Dict[st
         dropout=float(ckpt.get("dropout", 0.2)),
     ).to(args.device)
     model.load_state_dict(ckpt["model_state_dict"])
-    threshold = saved_validation_threshold(ckpt, args.threshold)
-    files = raw_validation_files(args.split_path, args.feather_root, args.raw_chips_dir)
+    threshold = saved_threshold(ckpt, args.split, args.threshold)
+    files = raw_validation_files(args.split_path, args.split, args.feather_root, args.raw_chips_dir)
     _, base_metrics, details = raw_train._evaluate_files(
         model=model,
         loss_fn=nn.BCEWithLogitsLoss(),
@@ -395,8 +401,8 @@ def _evaluate_embedding_arrays(
     stats_npz = np.load(args.stats_path)
     x_mean = stats_npz["x_mean"]
     x_std = stats_npz["x_std"]
-    threshold = saved_validation_threshold(ckpt, args.threshold)
-    files = embedding_validation_files(args.split_path, args.feather_root, args.embedding_dir)
+    threshold = saved_threshold(ckpt, args.split, args.threshold)
+    files = embedding_validation_files(args.split_path, args.split, args.feather_root, args.embedding_dir)
     x_val, y_val = emb_train.load_dataset(files, sample_ratio=1.0, max_samples_per_file=None, seed=args.seed)
     x_val = (x_val - x_mean) / x_std
     _, base_metrics, details = emb_train._evaluate_in_batches(
@@ -439,11 +445,12 @@ def evaluate_embedding_transformer(args: argparse.Namespace, config: EvalConfig)
 
 
 def build_parser(config: EvalConfig) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=f"Evaluate {config.model_name} validation distance-aware IoU metrics.")
+    parser = argparse.ArgumentParser(description=f"Evaluate {config.model_name} distance-aware IoU metrics.")
     parser.add_argument("--model-output-dir", type=Path, default=config.default_output_dir)
     parser.add_argument("--model-path", type=Path, default=config.default_model_path)
     parser.add_argument("--stats-path", type=Path, default=config.default_stats_path)
     parser.add_argument("--split-path", type=Path, default=config.default_split_path)
+    parser.add_argument("--split", choices=["train", "validation", "test"], default="test")
     parser.add_argument("--feather-root", type=Path, default=Path(emb_train.FEATHER_ROOT))
     parser.add_argument("--raw-chips-dir", type=Path, default=Path(raw_train.RAW_CHIPS_DIR))
     parser.add_argument("--embedding-dir", type=Path, default=Path(emb_train.EMBEDDING_DIR))
@@ -461,7 +468,7 @@ def run(config: EvalConfig) -> int:
     args.model_path = args.model_path if args.model_path.is_absolute() else args.model_output_dir / args.model_path
     args.stats_path = args.stats_path if args.stats_path.is_absolute() else args.model_output_dir / args.stats_path
     args.split_path = args.split_path if args.split_path.is_absolute() else args.model_output_dir / args.split_path
-    output_json = args.output_json or (args.model_output_dir / "validation_distance_iou_metrics.json")
+    output_json = args.output_json or (args.model_output_dir / f"{args.split}_distance_iou_metrics.json")
 
     evaluators = {
         "raw_unet": evaluate_raw_unet,
@@ -472,6 +479,7 @@ def run(config: EvalConfig) -> int:
     metrics = evaluators[config.model_kind](args, config)
     metrics["model_output_dir"] = str(args.model_output_dir)
     metrics["split_path"] = str(args.split_path)
+    metrics["split"] = args.split
     _print_summary(metrics)
     _write_outputs(output_json, metrics)
     return 0

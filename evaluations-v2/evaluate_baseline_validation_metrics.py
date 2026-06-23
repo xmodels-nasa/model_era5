@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate baseline raw-chip U-Net validation distance-aware IoU metrics."""
+"""Evaluate baseline raw-chip U-Net distance-aware IoU metrics."""
 
 from distance_metrics_common import EvalConfig, RESULTS_DIR, run
 
