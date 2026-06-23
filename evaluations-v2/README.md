@@ -21,13 +21,18 @@ Empty ground truth keeps the strict definition:
 
 ## Run
 
-From `/Users/charley/nasa/4dcloud-2026/model_era5`:
+Activate the project virtual environment first, then run from the project root:
 
 ```bash
-uv run python evaluations-v2/evaluate_baseline_validation_metrics.py
-uv run python evaluations-v2/evaluate_aurora_validation_metrics.py
-uv run python evaluations-v2/evaluate_fine_tune_validation_metrics.py
-uv run python evaluations-v2/evaluate_transformer_validation_metrics.py
+cd /home/charley/model_era5
+source .venv/bin/activate
+```
+
+```bash
+python evaluations-v2/evaluate_baseline_validation_metrics.py
+python evaluations-v2/evaluate_aurora_validation_metrics.py
+python evaluations-v2/evaluate_fine_tune_validation_metrics.py
+python evaluations-v2/evaluate_transformer_validation_metrics.py
 ```
 
 Each script writes:
@@ -48,11 +53,11 @@ By default, paths come from `.env`:
 If the validation files are somewhere else, override them:
 
 ```bash
-uv run python evaluations-v2/evaluate_baseline_validation_metrics.py \
+python evaluations-v2/evaluate_baseline_validation_metrics.py \
   --feather-root /path/to/feathers \
   --raw-chips-dir /path/to/raw_chips
 
-uv run python evaluations-v2/evaluate_fine_tune_validation_metrics.py \
+python evaluations-v2/evaluate_fine_tune_validation_metrics.py \
   --feather-root /path/to/feathers \
   --embedding-dir /path/to/embeddings
 ```
