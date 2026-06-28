@@ -14,6 +14,7 @@ BASELINE_TRAIN_FORECAST_SCRIPT := baseline_model/train_multilabel_from_raw_chips
 BASELINE_AURORA_TRAIN_SCRIPT := baseline_model/train_multilable_from_rawchips_aurora_architecturer.py
 BASELINE_AURORA_TRAIN_FORECAST_SCRIPT := baseline_model/train_multilable_from_rawchips_aurora_architecturer_forecast.py
 LOG_DIR := logs
+TRAIN_FILES := 500
 
 run: ft
 
@@ -21,7 +22,7 @@ ft:
 	@mkdir -p "$(LOG_DIR)"
 	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
 	log_file="$(LOG_DIR)/train_multilabel_from_feather_embeddings_$${timestamp}.log"; \
-	PYTHONUNBUFFERED=1 nohup python3 -u "$(FT_SCRIPT)" > "$$log_file" 2>&1 & \
+	PYTHONUNBUFFERED=1 nohup python3 -u "$(FT_SCRIPT)" --train-files "$(TRAIN_FILES)" > "$$log_file" 2>&1 & \
 	echo "Started fine-tuning in background. PID=$$!"; \
 	echo "Log file: $$log_file"
 
@@ -29,7 +30,7 @@ ft-transformer:
 	@mkdir -p "$(LOG_DIR)" ".matplotlib"
 	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
 	log_file="$(LOG_DIR)/train_multilabel_from_feather_embeddings_transformer_$${timestamp}.log"; \
-	MPLCONFIGDIR="$(CURDIR)/.matplotlib" PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(FT_TRANSFORMER_SCRIPT)" > "$$log_file" 2>&1 & \
+	MPLCONFIGDIR="$(CURDIR)/.matplotlib" PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(FT_TRANSFORMER_SCRIPT)" --train-files "$(TRAIN_FILES)" > "$$log_file" 2>&1 & \
 	echo "Started transformer embedding fine-tuning in background. PID=$$!"; \
 	echo "Log file: $$log_file"
 
@@ -85,7 +86,7 @@ baseline-train:
 	@mkdir -p "$(LOG_DIR)"
 	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
 	log_file="$(LOG_DIR)/train_multilabel_from_raw_chips_$${timestamp}.log"; \
-	PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(BASELINE_TRAIN_SCRIPT)" > "$$log_file" 2>&1 & \
+	PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(BASELINE_TRAIN_SCRIPT)" --train-files "$(TRAIN_FILES)" > "$$log_file" 2>&1 & \
 	echo "Started baseline raw-chip training in background. PID=$$!"; \
 	echo "Log file: $$log_file"
 
@@ -101,7 +102,7 @@ baseline-train-aurora:
 	@mkdir -p "$(LOG_DIR)"
 	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
 	log_file="$(LOG_DIR)/train_multilable_from_rawchips_aurora_architecturer_$${timestamp}.log"; \
-	PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(BASELINE_AURORA_TRAIN_SCRIPT)" > "$$log_file" 2>&1 & \
+	PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(BASELINE_AURORA_TRAIN_SCRIPT)" --train-files "$(TRAIN_FILES)" > "$$log_file" 2>&1 & \
 	echo "Started Aurora-style baseline raw-chip training in background. PID=$$!"; \
 	echo "Log file: $$log_file"
 
