@@ -71,3 +71,39 @@ Useful optional flags:
 --threshold 0.83
 --output-json /path/to/metrics.json
 ```
+
+## Cloudy-Sky Mask Visualizations
+
+To find consecutive cloudy-sky test windows and plot ground truth overlaid with all four model predictions:
+
+```bash
+python evaluations-v2/visualize_cloudy_sky_test_windows.py
+```
+
+Default behavior:
+
+- scans the `test` split
+- requires 20 consecutive data points with cloudy-sky ground truth
+- keeps windows where fine-tuned models beat raw-chip models on strict IoU and tolerance IoU
+- saves up to 30 windows under `results-v2/cloudy_sky_mask_visualizations`
+
+Outputs per selected window:
+
+```text
+window_###_...png          overlay visualization
+window_###_..._points.csv  row index, lat/lon, per-row metrics
+window_###_..._masks.npz   ground truth, probabilities, binary predictions
+window_###_..._metrics.json
+summary.csv
+```
+
+Useful options:
+
+```bash
+python evaluations-v2/visualize_cloudy_sky_test_windows.py \
+  --window-size 20 \
+  --max-windows 30 \
+  --min-strict-gain 0.05 \
+  --min-tolerance-gain 0.10 \
+  --batch-size 4096
+```
