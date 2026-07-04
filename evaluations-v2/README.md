@@ -74,6 +74,37 @@ Useful optional flags:
 
 ## Cloudy-Sky Mask Visualizations
 
+To find individual cloudy-sky test profiles where the fine-tuned models have much better tolerance IoU than the raw-chip baselines:
+
+```bash
+python evaluations-v2/visualize_single_cloudy_sky_points.py
+```
+
+Default behavior:
+
+- scans the `test` split
+- requires ground truth to have more than 10 cloud-mask bins set to 1
+- ranks points where fine-tuned models beat raw-chip models on tolerance IoU @1 and @2
+- saves the best 20 points under `results-v2/single_cloudy_sky_point_visualizations`
+
+Each PNG shows five vertical 40-bin masks:
+
+```text
+Ground truth | Fine-tune Transformer | Fine-tune MLP | U-Net raw chips | Aurora raw chips
+```
+
+Black means mask value `1`; white means mask value `0`.
+
+Useful options:
+
+```bash
+python evaluations-v2/visualize_single_cloudy_sky_points.py \
+  --max-points 20 \
+  --min-target-ones 10 \
+  --min-tolerance-gain 0.25 \
+  --batch-size 4096
+```
+
 To find consecutive cloudy-sky test windows and plot ground truth overlaid with all four model predictions:
 
 ```bash
