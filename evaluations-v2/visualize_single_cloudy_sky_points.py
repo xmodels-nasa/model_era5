@@ -47,6 +47,9 @@ class PointCandidate:
     strict_gain: float
     tol1_gain: float
     tol2_gain: float
+    fine_tuned_positive_count_mean: float
+    raw_chip_positive_count_mean: float
+    positive_count_gap: float
     score: float
     target: np.ndarray
     preds: Dict[str, np.ndarray]
@@ -61,6 +64,29 @@ def strict_iou_is_similar(strict_gain: float, args: argparse.Namespace) -> bool:
 
 def average_metric(metrics: Dict[str, Dict[str, np.ndarray]], names: List[str], key: str, idx: int) -> float:
     return float(np.mean([float(metrics[name][key][idx]) for name in names]))
+
+
+def positive_count_stats(preds: Dict[str, np.ndarray], idx: int) -> Dict[str, float]:
+    fine_counts = [int(preds[name][idx].sum()) for name in FINE_TUNED_MODELS]
+    raw_counts = [int(preds[name][idx].sum()) for name in RAW_CHIP_MODELS]
+    return {
+        "fine_min": float(min(fine_counts)),
+        "fine_mean": float(np.mean(fine_counts)),
+        "raw_min": float(min(raw_counts)),
+        "raw_mean": float(np.mean(raw_counts)),
+        "gap": float(abs(np.mean(fine_counts) - np.mean(raw_counts))),
+    }
+
+
+def positive_counts_are_similar(preds: Dict[str, np.ndarray], idx: int, args: argparse.Namespace) -> bool:
+    stats = positive_count_stats(preds, idx)
+    if stats["fine_min"] < args.min_pred_ones:
+        return False
+    if stats["raw_min"] < args.min_pred_ones:
+        return False
+    if stats["fine_mean"] > args.max_pred_ones or stats["raw_mean"] > args.max_pred_ones:
+        return False
+    return stats["gap"] <= args.max_pred_count_gap
 
 
 def read_geo(feather_path: Path, row_index: int) -> Dict[str, Any]:
@@ -94,6 +120,9 @@ def collect_candidates_for_file(
     candidates: List[PointCandidate] = []
     valid_target_count = (target_counts >= args.min_target_ones) & (target_counts <= args.max_target_ones)
     for idx in np.flatnonzero(valid_target_count):
+        pred_count_stats = positive_count_stats(preds, int(idx))
+        if not positive_counts_are_similar(preds, int(idx), args):
+            continue
         strict_ft = average_metric(metrics, FINE_TUNED_MODELS, "strict", int(idx))
         strict_raw = average_metric(metrics, RAW_CHIP_MODELS, "strict", int(idx))
         tol1_ft = average_metric(metrics, FINE_TUNED_MODELS, "tol1", int(idx))
@@ -121,7 +150,14 @@ def collect_candidates_for_file(
         }
         strict_similarity_bonus = max(0.0, args.strict_similarity_width - abs(strict_gain))
         sparse_bonus = max(0.0, 1.0 - (int(target_counts[idx]) - args.min_target_ones) / max(args.max_target_ones, 1))
-        score = float(tol1_gain + tol2_gain + 0.25 * strict_similarity_bonus + 0.05 * sparse_bonus)
+        count_similarity_bonus = max(0.0, args.max_pred_count_gap - pred_count_stats["gap"])
+        score = float(
+            tol1_gain
+            + tol2_gain
+            + 0.25 * strict_similarity_bonus
+            + 0.05 * sparse_bonus
+            + 0.03 * count_similarity_bonus
+        )
         candidates.append(
             PointCandidate(
                 file_stem=raw_meta.source_file.stem,
@@ -132,6 +168,9 @@ def collect_candidates_for_file(
                 strict_gain=float(strict_gain),
                 tol1_gain=float(tol1_gain),
                 tol2_gain=float(tol2_gain),
+                fine_tuned_positive_count_mean=pred_count_stats["fine_mean"],
+                raw_chip_positive_count_mean=pred_count_stats["raw_mean"],
+                positive_count_gap=pred_count_stats["gap"],
                 score=score,
                 target=targets[idx].astype(np.uint8),
                 preds={name: preds[name][idx].astype(np.uint8) for name in MODEL_ORDER},
@@ -165,7 +204,9 @@ def save_candidate(idx: int, candidate: PointCandidate, out_dir: Path) -> Dict[s
     ax.set_title(
         f"{candidate.file_stem} | row {candidate.row_index} | target ones={candidate.target_positive_count}\n"
         f"fine-tuned minus raw: strict={candidate.strict_gain:+.3f}, "
-        f"tol@1={candidate.tol1_gain:+.3f}, tol@2={candidate.tol2_gain:+.3f}"
+        f"tol@1={candidate.tol1_gain:+.3f}, tol@2={candidate.tol2_gain:+.3f}\n"
+        f"predicted ones mean: fine-tuned={candidate.fine_tuned_positive_count_mean:.1f}, "
+        f"raw={candidate.raw_chip_positive_count_mean:.1f}"
     )
     ax.set_xlabel("Black = cloud bin / label 1, white = clear bin / label 0")
     for x in np.arange(0.5, len(labels) - 0.5, 1.0):
@@ -193,6 +234,9 @@ def save_candidate(idx: int, candidate: PointCandidate, out_dir: Path) -> Dict[s
         "strict_gain": candidate.strict_gain,
         "tolerance_iou_1_gain": candidate.tol1_gain,
         "tolerance_iou_2_gain": candidate.tol2_gain,
+        "fine_tuned_positive_count_mean": candidate.fine_tuned_positive_count_mean,
+        "raw_chip_positive_count_mean": candidate.raw_chip_positive_count_mean,
+        "positive_count_gap": candidate.positive_count_gap,
         "score": candidate.score,
         "geo": geo,
         "model_metrics": candidate.metrics,
@@ -206,9 +250,12 @@ def save_candidate(idx: int, candidate: PointCandidate, out_dir: Path) -> Dict[s
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR / "single_cloudy_sky_point_visualizations")
-    parser.add_argument("--max-points", type=int, default=20)
-    parser.add_argument("--min-target-ones", type=int, default=2)
+    parser.add_argument("--max-points", type=int, default=100)
+    parser.add_argument("--min-target-ones", type=int, default=3)
     parser.add_argument("--max-target-ones", type=int, default=10)
+    parser.add_argument("--min-pred-ones", type=int, default=1)
+    parser.add_argument("--max-pred-ones", type=int, default=12)
+    parser.add_argument("--max-pred-count-gap", type=float, default=3.0)
     parser.add_argument("--strict-gain-min", type=float, default=-0.08)
     parser.add_argument("--strict-gain-max", type=float, default=0.08)
     parser.add_argument("--strict-similarity-width", type=float, default=0.08)
@@ -232,6 +279,12 @@ def main() -> int:
         raise ValueError("--min-target-ones must be >= 1")
     if args.max_target_ones < args.min_target_ones:
         raise ValueError("--max-target-ones must be >= --min-target-ones")
+    if args.min_pred_ones < 1:
+        raise ValueError("--min-pred-ones must be >= 1")
+    if args.max_pred_ones < args.min_pred_ones:
+        raise ValueError("--max-pred-ones must be >= --min-pred-ones")
+    if args.max_pred_count_gap < 0:
+        raise ValueError("--max-pred-count-gap must be >= 0")
     if args.strict_gain_max < args.strict_gain_min:
         raise ValueError("--strict-gain-max must be >= --strict-gain-min")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -301,6 +354,9 @@ def main() -> int:
             "strict_gain",
             "tolerance_iou_1_gain",
             "tolerance_iou_2_gain",
+            "fine_tuned_positive_count_mean",
+            "raw_chip_positive_count_mean",
+            "positive_count_gap",
             "score",
             "png_path",
             "npz_path",

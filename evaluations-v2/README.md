@@ -83,11 +83,12 @@ python evaluations-v2/visualize_single_cloudy_sky_points.py
 Default behavior:
 
 - scans the `test` split
-- requires ground truth to have 2-10 cloud-mask bins set to 1
+- requires ground truth to have 3-10 cloud-mask bins set to 1
+- requires both fine-tuned and raw-chip model groups to make nonzero, similar numbers of positive predictions
 - keeps points where fine-tuned strict IoU is close to raw-chip strict IoU
 - ranks points where fine-tuned models beat raw-chip models on tolerance IoU @1 and @2
 - diversifies the result by defaulting to at most one point per test file
-- saves the best 20 points under `results-v2/single_cloudy_sky_point_visualizations`
+- saves the best 100 points under `results-v2/single_cloudy_sky_point_visualizations`
 
 Each PNG shows five vertical 40-bin masks:
 
@@ -101,9 +102,12 @@ Useful options:
 
 ```bash
 python evaluations-v2/visualize_single_cloudy_sky_points.py \
-  --max-points 20 \
-  --min-target-ones 2 \
+  --max-points 100 \
+  --min-target-ones 3 \
   --max-target-ones 10 \
+  --min-pred-ones 1 \
+  --max-pred-ones 12 \
+  --max-pred-count-gap 3 \
   --strict-gain-min -0.08 \
   --strict-gain-max 0.08 \
   --min-tolerance-gain 0.20 \
