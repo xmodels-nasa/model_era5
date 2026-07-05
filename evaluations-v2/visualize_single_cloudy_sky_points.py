@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find single cloudy-sky test points where fine-tuned models win by tolerance IoU."""
+"""Find sparse cloudy-sky test points where fine-tuned models win by tolerance IoU."""
 
 from __future__ import annotations
 
@@ -55,6 +55,10 @@ class PointCandidate:
     feather_path: Path
 
 
+def strict_iou_is_similar(strict_gain: float, args: argparse.Namespace) -> bool:
+    return args.strict_gain_min <= strict_gain <= args.strict_gain_max
+
+
 def average_metric(metrics: Dict[str, Dict[str, np.ndarray]], names: List[str], key: str, idx: int) -> float:
     return float(np.mean([float(metrics[name][key][idx]) for name in names]))
 
@@ -88,7 +92,8 @@ def collect_candidates_for_file(
     target_counts = targets.sum(axis=1).astype(np.int32)
 
     candidates: List[PointCandidate] = []
-    for idx in np.flatnonzero(target_counts > args.min_target_ones):
+    valid_target_count = (target_counts >= args.min_target_ones) & (target_counts <= args.max_target_ones)
+    for idx in np.flatnonzero(valid_target_count):
         strict_ft = average_metric(metrics, FINE_TUNED_MODELS, "strict", int(idx))
         strict_raw = average_metric(metrics, RAW_CHIP_MODELS, "strict", int(idx))
         tol1_ft = average_metric(metrics, FINE_TUNED_MODELS, "tol1", int(idx))
@@ -98,7 +103,7 @@ def collect_candidates_for_file(
         strict_gain = strict_ft - strict_raw
         tol1_gain = tol1_ft - tol1_raw
         tol2_gain = tol2_ft - tol2_raw
-        if strict_gain < args.min_strict_gain:
+        if not strict_iou_is_similar(strict_gain, args):
             continue
         if tol1_gain < args.min_tolerance_gain or tol2_gain < args.min_tolerance_gain:
             continue
@@ -114,7 +119,9 @@ def collect_candidates_for_file(
             name: {key: float(metrics[name][key][idx]) for key in ("strict", "tol1", "tol2")}
             for name in MODEL_ORDER
         }
-        score = float(tol1_gain + tol2_gain + 0.5 * strict_gain + 0.01 * int(target_counts[idx]))
+        strict_similarity_bonus = max(0.0, args.strict_similarity_width - abs(strict_gain))
+        sparse_bonus = max(0.0, 1.0 - (int(target_counts[idx]) - args.min_target_ones) / max(args.max_target_ones, 1))
+        score = float(tol1_gain + tol2_gain + 0.25 * strict_similarity_bonus + 0.05 * sparse_bonus)
         candidates.append(
             PointCandidate(
                 file_stem=raw_meta.source_file.stem,
@@ -200,9 +207,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR / "single_cloudy_sky_point_visualizations")
     parser.add_argument("--max-points", type=int, default=20)
-    parser.add_argument("--min-target-ones", type=int, default=10)
-    parser.add_argument("--min-strict-gain", type=float, default=0.0)
-    parser.add_argument("--min-tolerance-gain", type=float, default=0.25)
+    parser.add_argument("--min-target-ones", type=int, default=2)
+    parser.add_argument("--max-target-ones", type=int, default=10)
+    parser.add_argument("--strict-gain-min", type=float, default=-0.08)
+    parser.add_argument("--strict-gain-max", type=float, default=0.08)
+    parser.add_argument("--strict-similarity-width", type=float, default=0.08)
+    parser.add_argument("--min-tolerance-gain", type=float, default=0.20)
+    parser.add_argument("--max-points-per-file", type=int, default=1)
+    parser.add_argument("--min-row-separation", type=int, default=250)
     parser.add_argument("--require-each-finetune-better", action="store_true")
     parser.add_argument("--threshold", type=float, default=None, help="Override all saved model thresholds.")
     parser.add_argument("--batch-size", type=int, default=2048)
@@ -216,6 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.min_target_ones < 1:
+        raise ValueError("--min-target-ones must be >= 1")
+    if args.max_target_ones < args.min_target_ones:
+        raise ValueError("--max-target-ones must be >= --min-target-ones")
+    if args.strict_gain_max < args.strict_gain_min:
+        raise ValueError("--strict-gain-max must be >= --strict-gain-min")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     bundles = load_bundles(args.device, args.threshold)
@@ -244,10 +262,25 @@ def main() -> int:
         candidates = collect_candidates_for_file(raw_by_stem[stem], emb_by_stem[stem], bundles, args)
         best.extend(candidates)
         best.sort(key=lambda c: c.score, reverse=True)
-        best = best[: max(args.max_points * 5, args.max_points)]
+        best = best[: max(args.max_points * 50, args.max_points)]
         print(f"  candidates in file: {len(candidates)} | retained candidates: {len(best)}")
 
-    selected = sorted(best, key=lambda c: c.score, reverse=True)[: args.max_points]
+    selected: List[PointCandidate] = []
+    selected_by_file: Dict[str, int] = {}
+    for candidate in sorted(best, key=lambda c: c.score, reverse=True):
+        if len(selected) >= args.max_points:
+            break
+        if selected_by_file.get(candidate.file_stem, 0) >= args.max_points_per_file:
+            continue
+        too_close = any(
+            existing.file_stem == candidate.file_stem
+            and abs(existing.row_index - candidate.row_index) < args.min_row_separation
+            for existing in selected
+        )
+        if too_close:
+            continue
+        selected.append(candidate)
+        selected_by_file[candidate.file_stem] = selected_by_file.get(candidate.file_stem, 0) + 1
     if len(selected) < args.max_points:
         print(f"Only found {len(selected)} matching points; requested {args.max_points}.")
 

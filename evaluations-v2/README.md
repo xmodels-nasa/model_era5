@@ -74,7 +74,7 @@ Useful optional flags:
 
 ## Cloudy-Sky Mask Visualizations
 
-To find individual cloudy-sky test profiles where the fine-tuned models have much better tolerance IoU than the raw-chip baselines:
+To find individual sparse cloudy-sky test profiles where strict IoU is similar, but the fine-tuned models have much better tolerance IoU than the raw-chip baselines:
 
 ```bash
 python evaluations-v2/visualize_single_cloudy_sky_points.py
@@ -83,8 +83,10 @@ python evaluations-v2/visualize_single_cloudy_sky_points.py
 Default behavior:
 
 - scans the `test` split
-- requires ground truth to have more than 10 cloud-mask bins set to 1
+- requires ground truth to have 2-10 cloud-mask bins set to 1
+- keeps points where fine-tuned strict IoU is close to raw-chip strict IoU
 - ranks points where fine-tuned models beat raw-chip models on tolerance IoU @1 and @2
+- diversifies the result by defaulting to at most one point per test file
 - saves the best 20 points under `results-v2/single_cloudy_sky_point_visualizations`
 
 Each PNG shows five vertical 40-bin masks:
@@ -100,8 +102,12 @@ Useful options:
 ```bash
 python evaluations-v2/visualize_single_cloudy_sky_points.py \
   --max-points 20 \
-  --min-target-ones 10 \
-  --min-tolerance-gain 0.25 \
+  --min-target-ones 2 \
+  --max-target-ones 10 \
+  --strict-gain-min -0.08 \
+  --strict-gain-max 0.08 \
+  --min-tolerance-gain 0.20 \
+  --max-points-per-file 1 \
   --batch-size 4096
 ```
 
