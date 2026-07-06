@@ -46,6 +46,12 @@ MODEL_ORDER = [
     "U-Net raw chips",
     "Aurora raw chips",
 ]
+DISPLAY_NAMES = {
+    "Fine-tune Transformer": "Transformer",
+    "Fine-tune MLP": "MLP",
+    "U-Net raw chips": "U-Net",
+    "Aurora raw chips": "Aurora",
+}
 FINE_TUNED_MODELS = ["Fine-tune Transformer", "Fine-tune MLP"]
 RAW_CHIP_MODELS = ["U-Net raw chips", "Aurora raw chips"]
 
@@ -462,7 +468,7 @@ def save_candidate_outputs(
     fig, axes = plt.subplots(
         nrows=1,
         ncols=1 + len(MODEL_ORDER),
-        figsize=(16, max(6, rows.size * 0.18)),
+        figsize=(18, max(6, rows.size * 0.18)),
         sharex=True,
         sharey=True,
         constrained_layout=True,
@@ -471,23 +477,36 @@ def save_candidate_outputs(
     panels.extend((name, classes[name]) for name in MODEL_ORDER)
     for ax, (title, image) in zip(axes, panels):
         ax.imshow(image.T, aspect="auto", interpolation="nearest", cmap="gray_r", vmin=0, vmax=1, origin="lower")
-        ax.set_title(title)
+        ax.text(
+            0.03,
+            0.97,
+            DISPLAY_NAMES.get(title, title),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=11,
+            fontweight="bold",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.65", "alpha": 0.9},
+        )
+        ax.set_title(title if title == "Ground truth" else "", fontsize=10)
         ax.set_xlabel("data point")
     axes[0].set_ylabel("40-bin cloud mask index")
     for ax, name in zip(axes[1:], MODEL_ORDER):
         ax.set_title(
-            f"{name} | strict={metrics[name]['strict'].mean():.3f}, "
-            f"tol@1={metrics[name]['tol1'].mean():.3f}, tol@2={metrics[name]['tol2'].mean():.3f}, "
-            f"thr={bundles[name].threshold:.2f}"
+            f"strict={metrics[name]['strict'].mean():.3f}\n"
+            f"tol@1={metrics[name]['tol1'].mean():.3f}, tol@2={metrics[name]['tol2'].mean():.3f}\n"
+            f"thr={bundles[name].threshold:.2f}",
+            fontsize=9,
         )
     x_ticks = np.linspace(0, rows.size - 1, num=min(6, rows.size), dtype=int)
     for ax in axes:
         ax.set_xticks(x_ticks, labels=[str(int(rows[i])) for i in x_ticks], rotation=30, ha="right")
     fig.suptitle(
-        f"{candidate.file_stem} | rows {candidate.first_row}-{candidate.last_row} | "
-        f"fine-tuned minus raw gains: strict={candidate.strict_gain:+.3f}, "
-        f"tol@1={candidate.tol1_gain:+.3f}, tol@2={candidate.tol2_gain:+.3f} | "
-        f"predicted ones mean: fine-tuned={candidate.fine_tuned_positive_count_mean:.1f}, "
+        f"{candidate.file_stem}\n"
+        f"Rows {candidate.first_row}-{candidate.last_row} | matching rows={candidate.matching_row_count}/{int(rows.size)}\n"
+        f"Fine-tuned minus raw gains: strict={candidate.strict_gain:+.3f}, "
+        f"tol@1={candidate.tol1_gain:+.3f}, tol@2={candidate.tol2_gain:+.3f}\n"
+        f"Predicted cloud-bin count mean: fine-tuned={candidate.fine_tuned_positive_count_mean:.1f}, "
         f"raw={candidate.raw_chip_positive_count_mean:.1f}",
         fontsize=12,
     )
@@ -536,7 +555,7 @@ def save_candidate_outputs(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR / "cloudy_sky_mask_visualizations")
-    parser.add_argument("--max-windows", type=int, default=30)
+    parser.add_argument("--max-windows", type=int, default=100)
     parser.add_argument("--window-size", type=int, default=20)
     parser.add_argument("--window-stride", type=int, default=10)
     parser.add_argument("--min-matching-rows", type=int, default=3)

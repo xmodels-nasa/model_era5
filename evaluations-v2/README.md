@@ -128,7 +128,7 @@ Default behavior:
 - requires at least 3 rows in the window to match the sparse cloudy-sky criteria
 - matching rows have 2-12 target cloud bins, nonzero/similar prediction counts, similar strict IoU, and better fine-tuned tolerance IoU
 - plots five curtain panels: ground truth, Transformer, MLP, U-Net, Aurora
-- saves up to 30 windows under `results-v2/cloudy_sky_mask_visualizations`
+- saves up to 100 windows under `results-v2/cloudy_sky_mask_visualizations`
 
 Outputs per selected window:
 
@@ -145,7 +145,7 @@ Useful options:
 ```bash
 python evaluations-v2/visualize_cloudy_sky_test_windows.py \
   --window-size 20 \
-  --max-windows 30 \
+  --max-windows 100 \
   --min-matching-rows 3 \
   --min-target-ones 2 \
   --max-target-ones 12 \
