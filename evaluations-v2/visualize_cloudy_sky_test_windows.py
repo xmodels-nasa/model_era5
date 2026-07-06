@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Find and plot cloudy-sky test windows where fine-tuned models improve.
+"""Find and plot sparse cloudy-sky test windows where tolerance IoU improves.
 
-The output is a folder containing one PNG overlay per selected consecutive
-window, plus CSV/NPZ/JSON data for the same window. Horizontally, plots follow
-consecutive data points from one test file. Vertically, they show the 40 cloud
-mask bins.
+The output is a folder containing one curtain-panel PNG per selected
+consecutive window, plus CSV/NPZ/JSON data for the same window. Horizontally,
+plots follow consecutive data points from one test file. Vertically, they show
+the 40 cloud mask bins.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -76,6 +75,10 @@ class Candidate:
     strict_gain: float
     tol1_gain: float
     tol2_gain: float
+    fine_tuned_positive_count_mean: float
+    raw_chip_positive_count_mean: float
+    positive_count_gap: float
+    matching_row_count: int
     composite_gain: float
     metrics: Dict[str, float]
 
@@ -282,6 +285,57 @@ def window_metric_mean(metrics: Dict[str, Dict[str, np.ndarray]], names: List[st
     return float(np.mean(values))
 
 
+def positive_count_stats(classes: Dict[str, np.ndarray], start: int, stop: int) -> Dict[str, np.ndarray | float]:
+    fine_counts = np.stack([classes[name][start:stop].sum(axis=1) for name in FINE_TUNED_MODELS], axis=1).astype(np.float32)
+    raw_counts = np.stack([classes[name][start:stop].sum(axis=1) for name in RAW_CHIP_MODELS], axis=1).astype(np.float32)
+    fine_mean_by_row = fine_counts.mean(axis=1)
+    raw_mean_by_row = raw_counts.mean(axis=1)
+    return {
+        "fine_min_by_row": fine_counts.min(axis=1),
+        "raw_min_by_row": raw_counts.min(axis=1),
+        "fine_mean_by_row": fine_mean_by_row,
+        "raw_mean_by_row": raw_mean_by_row,
+        "gap_by_row": np.abs(fine_mean_by_row - raw_mean_by_row),
+        "fine_mean": float(fine_mean_by_row.mean()),
+        "raw_mean": float(raw_mean_by_row.mean()),
+        "gap": float(np.abs(fine_mean_by_row - raw_mean_by_row).mean()),
+    }
+
+
+def row_match_mask(
+    targets: np.ndarray,
+    classes: Dict[str, np.ndarray],
+    metrics: Dict[str, Dict[str, np.ndarray]],
+    start: int,
+    stop: int,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    target_counts = targets[start:stop].sum(axis=1)
+    valid_target_count = (target_counts >= args.min_target_ones) & (target_counts <= args.max_target_ones)
+    strict_ft = np.mean([metrics[name]["strict"][start:stop] for name in FINE_TUNED_MODELS], axis=0)
+    strict_raw = np.mean([metrics[name]["strict"][start:stop] for name in RAW_CHIP_MODELS], axis=0)
+    tol1_ft = np.mean([metrics[name]["tol1"][start:stop] for name in FINE_TUNED_MODELS], axis=0)
+    tol1_raw = np.mean([metrics[name]["tol1"][start:stop] for name in RAW_CHIP_MODELS], axis=0)
+    tol2_ft = np.mean([metrics[name]["tol2"][start:stop] for name in FINE_TUNED_MODELS], axis=0)
+    tol2_raw = np.mean([metrics[name]["tol2"][start:stop] for name in RAW_CHIP_MODELS], axis=0)
+    strict_gain = strict_ft - strict_raw
+    tol1_gain = tol1_ft - tol1_raw
+    tol2_gain = tol2_ft - tol2_raw
+    count_stats = positive_count_stats(classes, start, stop)
+    return (
+        valid_target_count
+        & (strict_gain >= args.strict_gain_min)
+        & (strict_gain <= args.strict_gain_max)
+        & (tol1_gain >= args.min_tolerance_gain)
+        & (tol2_gain >= args.min_tolerance_gain)
+        & (count_stats["fine_min_by_row"] >= args.min_pred_ones)
+        & (count_stats["raw_min_by_row"] >= args.min_pred_ones)
+        & (count_stats["fine_mean_by_row"] <= args.max_pred_ones)
+        & (count_stats["raw_mean_by_row"] <= args.max_pred_ones)
+        & (count_stats["gap_by_row"] <= args.max_pred_count_gap)
+    )
+
+
 def scan_candidates_for_file(
     raw_meta: raw_train.FileMeta,
     emb_meta: emb_train.FileMeta,
@@ -298,15 +352,15 @@ def scan_candidates_for_file(
         for name in MODEL_ORDER
     }
     metrics = {name: per_row_metrics(classes[name], targets) for name in MODEL_ORDER}
-    cloudy = targets.sum(axis=1) > 0
-
     candidates: List[Candidate] = []
     for run_start, run_stop in consecutive_runs(rows):
         if run_stop - run_start < args.window_size:
             continue
         for start in range(run_start, run_stop - args.window_size + 1, args.window_stride):
             stop = start + args.window_size
-            if not bool(cloudy[start:stop].all()):
+            match_mask = row_match_mask(targets, classes, metrics, start, stop, args)
+            matching_row_count = int(match_mask.sum())
+            if matching_row_count < args.min_matching_rows:
                 continue
             strict_ft = window_metric_mean(metrics, FINE_TUNED_MODELS, "strict", start, stop)
             strict_raw = window_metric_mean(metrics, RAW_CHIP_MODELS, "strict", start, stop)
@@ -317,9 +371,16 @@ def scan_candidates_for_file(
             strict_gain = strict_ft - strict_raw
             tol1_gain = tol1_ft - tol1_raw
             tol2_gain = tol2_ft - tol2_raw
-            if strict_gain < args.min_strict_gain:
+            if strict_gain < args.strict_gain_min or strict_gain > args.strict_gain_max:
                 continue
             if tol1_gain < args.min_tolerance_gain or tol2_gain < args.min_tolerance_gain:
+                continue
+            count_stats = positive_count_stats(classes, start, stop)
+            if count_stats["fine_mean"] < args.min_pred_ones or count_stats["raw_mean"] < args.min_pred_ones:
+                continue
+            if count_stats["fine_mean"] > args.max_pred_ones or count_stats["raw_mean"] > args.max_pred_ones:
+                continue
+            if count_stats["gap"] > args.max_pred_count_gap:
                 continue
             if args.require_each_finetune_better:
                 raw_best_strict = max(float(metrics[n]["strict"][start:stop].mean()) for n in RAW_CHIP_MODELS)
@@ -350,7 +411,11 @@ def scan_candidates_for_file(
                     strict_gain=float(strict_gain),
                     tol1_gain=float(tol1_gain),
                     tol2_gain=float(tol2_gain),
-                    composite_gain=float(strict_gain + tol1_gain + tol2_gain),
+                    fine_tuned_positive_count_mean=float(count_stats["fine_mean"]),
+                    raw_chip_positive_count_mean=float(count_stats["raw_mean"]),
+                    positive_count_gap=float(count_stats["gap"]),
+                    matching_row_count=matching_row_count,
+                    composite_gain=float(tol1_gain + tol2_gain - abs(strict_gain) + 0.02 * matching_row_count),
                     metrics=model_metrics,
                 )
             )
@@ -375,16 +440,6 @@ def load_geo_for_rows(feather_path: Path, rows: np.ndarray) -> pd.DataFrame:
     return geo.reset_index(drop=True)
 
 
-def overlay_rgb(targets: np.ndarray, preds: np.ndarray) -> np.ndarray:
-    target = targets.astype(bool)
-    pred = preds.astype(bool)
-    image = np.ones((*target.shape, 3), dtype=np.float32)
-    image[target & ~pred] = np.asarray([0.95, 0.28, 0.12], dtype=np.float32)  # truth only
-    image[pred & ~target] = np.asarray([0.10, 0.34, 0.95], dtype=np.float32)  # prediction only
-    image[target & pred] = np.asarray([0.10, 0.70, 0.25], dtype=np.float32)  # overlap
-    return image
-
-
 def save_candidate_outputs(
     idx: int,
     candidate: Candidate,
@@ -405,38 +460,35 @@ def save_candidate_outputs(
     json_path = out_dir / f"{prefix}_metrics.json"
 
     fig, axes = plt.subplots(
-        nrows=1 + len(MODEL_ORDER),
-        ncols=1,
-        figsize=(max(12, rows.size * 0.24), 10),
+        nrows=1,
+        ncols=1 + len(MODEL_ORDER),
+        figsize=(16, max(6, rows.size * 0.18)),
         sharex=True,
         sharey=True,
         constrained_layout=True,
     )
-    axes[0].imshow(targets.T, aspect="auto", interpolation="nearest", cmap="gray_r", vmin=0, vmax=1, origin="lower")
-    axes[0].set_title("Ground truth cloudy-sky mask")
-    axes[0].set_ylabel("mask bin")
+    panels = [("Ground truth", targets)]
+    panels.extend((name, classes[name]) for name in MODEL_ORDER)
+    for ax, (title, image) in zip(axes, panels):
+        ax.imshow(image.T, aspect="auto", interpolation="nearest", cmap="gray_r", vmin=0, vmax=1, origin="lower")
+        ax.set_title(title)
+        ax.set_xlabel("data point")
+    axes[0].set_ylabel("40-bin cloud mask index")
     for ax, name in zip(axes[1:], MODEL_ORDER):
-        ax.imshow(overlay_rgb(targets, classes[name]).transpose(1, 0, 2), aspect="auto", interpolation="nearest", origin="lower")
-        ax.set_ylabel("mask bin")
         ax.set_title(
             f"{name} | strict={metrics[name]['strict'].mean():.3f}, "
             f"tol@1={metrics[name]['tol1'].mean():.3f}, tol@2={metrics[name]['tol2'].mean():.3f}, "
             f"thr={bundles[name].threshold:.2f}"
         )
     x_ticks = np.linspace(0, rows.size - 1, num=min(6, rows.size), dtype=int)
-    axes[-1].set_xticks(x_ticks, labels=[str(int(rows[i])) for i in x_ticks])
-    axes[-1].set_xlabel("consecutive feather row index")
-    legend_handles = [
-        mpatches.Patch(color=(0.10, 0.70, 0.25), label="truth and prediction"),
-        mpatches.Patch(color=(0.95, 0.28, 0.12), label="truth only"),
-        mpatches.Patch(color=(0.10, 0.34, 0.95), label="prediction only"),
-        mpatches.Patch(color=(1.00, 1.00, 1.00), label="clear bin"),
-    ]
-    fig.legend(handles=legend_handles, loc="upper right", bbox_to_anchor=(0.995, 0.995))
+    for ax in axes:
+        ax.set_xticks(x_ticks, labels=[str(int(rows[i])) for i in x_ticks], rotation=30, ha="right")
     fig.suptitle(
         f"{candidate.file_stem} | rows {candidate.first_row}-{candidate.last_row} | "
         f"fine-tuned minus raw gains: strict={candidate.strict_gain:+.3f}, "
-        f"tol@1={candidate.tol1_gain:+.3f}, tol@2={candidate.tol2_gain:+.3f}",
+        f"tol@1={candidate.tol1_gain:+.3f}, tol@2={candidate.tol2_gain:+.3f} | "
+        f"predicted ones mean: fine-tuned={candidate.fine_tuned_positive_count_mean:.1f}, "
+        f"raw={candidate.raw_chip_positive_count_mean:.1f}",
         fontsize=12,
     )
     fig.savefig(png_path, dpi=180)
@@ -467,6 +519,10 @@ def save_candidate_outputs(
         "strict_gain": candidate.strict_gain,
         "tolerance_iou_1_gain": candidate.tol1_gain,
         "tolerance_iou_2_gain": candidate.tol2_gain,
+        "fine_tuned_positive_count_mean": candidate.fine_tuned_positive_count_mean,
+        "raw_chip_positive_count_mean": candidate.raw_chip_positive_count_mean,
+        "positive_count_gap": candidate.positive_count_gap,
+        "matching_row_count": candidate.matching_row_count,
         "composite_gain": candidate.composite_gain,
         "model_metrics": candidate.metrics,
         "png_path": str(png_path),
@@ -482,9 +538,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR / "cloudy_sky_mask_visualizations")
     parser.add_argument("--max-windows", type=int, default=30)
     parser.add_argument("--window-size", type=int, default=20)
-    parser.add_argument("--window-stride", type=int, default=20)
-    parser.add_argument("--min-strict-gain", type=float, default=0.05)
-    parser.add_argument("--min-tolerance-gain", type=float, default=0.10)
+    parser.add_argument("--window-stride", type=int, default=10)
+    parser.add_argument("--min-matching-rows", type=int, default=8)
+    parser.add_argument("--min-target-ones", type=int, default=3)
+    parser.add_argument("--max-target-ones", type=int, default=10)
+    parser.add_argument("--min-pred-ones", type=int, default=1)
+    parser.add_argument("--max-pred-ones", type=int, default=12)
+    parser.add_argument("--max-pred-count-gap", type=float, default=3.0)
+    parser.add_argument("--strict-gain-min", type=float, default=-0.08)
+    parser.add_argument("--strict-gain-max", type=float, default=0.08)
+    parser.add_argument("--min-tolerance-gain", type=float, default=0.15)
     parser.add_argument("--require-each-finetune-better", action="store_true")
     parser.add_argument("--threshold", type=float, default=None, help="Override all saved model thresholds.")
     parser.add_argument("--batch-size", type=int, default=2048)
@@ -502,6 +565,14 @@ def main() -> int:
         raise ValueError("--window-size must be >= 1")
     if args.window_stride < 1:
         raise ValueError("--window-stride must be >= 1")
+    if args.min_matching_rows < 1 or args.min_matching_rows > args.window_size:
+        raise ValueError("--min-matching-rows must be in [1, --window-size]")
+    if args.max_target_ones < args.min_target_ones:
+        raise ValueError("--max-target-ones must be >= --min-target-ones")
+    if args.max_pred_ones < args.min_pred_ones:
+        raise ValueError("--max-pred-ones must be >= --min-pred-ones")
+    if args.strict_gain_max < args.strict_gain_min:
+        raise ValueError("--strict-gain-max must be >= --strict-gain-min")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     bundles = load_bundles(args.device, args.threshold)
@@ -558,6 +629,10 @@ def main() -> int:
             "strict_gain",
             "tolerance_iou_1_gain",
             "tolerance_iou_2_gain",
+            "fine_tuned_positive_count_mean",
+            "raw_chip_positive_count_mean",
+            "positive_count_gap",
+            "matching_row_count",
             "composite_gain",
             "png_path",
             "csv_path",

@@ -115,7 +115,7 @@ python evaluations-v2/visualize_single_cloudy_sky_points.py \
   --batch-size 4096
 ```
 
-To find consecutive cloudy-sky test windows and plot ground truth overlaid with all four model predictions:
+To find consecutive test windows and plot curtain-style masks for ground truth plus all four model predictions:
 
 ```bash
 python evaluations-v2/visualize_cloudy_sky_test_windows.py
@@ -124,14 +124,16 @@ python evaluations-v2/visualize_cloudy_sky_test_windows.py
 Default behavior:
 
 - scans the `test` split
-- requires 20 consecutive data points with cloudy-sky ground truth
-- keeps windows where fine-tuned models beat raw-chip models on strict IoU and tolerance IoU
+- uses 20-point consecutive windows
+- requires at least 8 rows in the window to match the sparse cloudy-sky criteria
+- matching rows have 3-10 target cloud bins, nonzero/similar prediction counts, similar strict IoU, and better fine-tuned tolerance IoU
+- plots five curtain panels: ground truth, Transformer, MLP, U-Net, Aurora
 - saves up to 30 windows under `results-v2/cloudy_sky_mask_visualizations`
 
 Outputs per selected window:
 
 ```text
-window_###_...png          overlay visualization
+window_###_...png          curtain-panel visualization
 window_###_..._points.csv  row index, lat/lon, per-row metrics
 window_###_..._masks.npz   ground truth, probabilities, binary predictions
 window_###_..._metrics.json
@@ -144,7 +146,11 @@ Useful options:
 python evaluations-v2/visualize_cloudy_sky_test_windows.py \
   --window-size 20 \
   --max-windows 30 \
-  --min-strict-gain 0.05 \
-  --min-tolerance-gain 0.10 \
+  --min-matching-rows 8 \
+  --min-target-ones 3 \
+  --max-target-ones 10 \
+  --strict-gain-min -0.08 \
+  --strict-gain-max 0.08 \
+  --min-tolerance-gain 0.15 \
   --batch-size 4096
 ```
