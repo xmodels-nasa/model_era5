@@ -1,7 +1,9 @@
-.PHONY: run ft ft-transformer ft-forecast ft-3x3 embedding embedding-forecast raw-chips raw-chips-forecast baseline-train baseline-train-forecast baseline-train-aurora baseline-train-aurora-forecast
+.PHONY: run ft ft-transformer ft-transformer-no-lat-lon ft-forecast ft-3x3 embedding embedding-forecast raw-chips raw-chips-forecast baseline-train baseline-train-forecast baseline-train-aurora baseline-train-aurora-forecast
 
 FT_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings.py
 FT_TRANSFORMER_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings_transformer.py
+FT_TRANSFORMER_NO_LAT_LON_SCRIPT := fine_tune_model_no_lat_lon_feature/train_multilabel_from_feather_embeddings_transformer_no_lat_lon.py
+FT_TRANSFORMER_NO_LAT_LON_OUTPUT_DIR := results-v3/model_outputs_transformer_no_lat_lon
 FT_FORECAST_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings_forecast.py
 FT_3X3_SCRIPT := fine_tuned_model/train_multilabel_from_feather_embeddings_3x3.py
 FT_3X3_ARGS := --sample-ratio 0.5
@@ -33,6 +35,15 @@ ft-transformer:
 	MPLCONFIGDIR="$(CURDIR)/.matplotlib" PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(FT_TRANSFORMER_SCRIPT)" --train-files "$(TRAIN_FILES)" > "$$log_file" 2>&1 & \
 	echo "Started transformer embedding fine-tuning in background. PID=$$!"; \
 	echo "Log file: $$log_file"
+
+ft-transformer-no-lat-lon:
+	@mkdir -p "$(LOG_DIR)" ".matplotlib" "$(FT_TRANSFORMER_NO_LAT_LON_OUTPUT_DIR)"
+	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
+	log_file="$(LOG_DIR)/train_multilabel_from_feather_embeddings_transformer_no_lat_lon_$${timestamp}.log"; \
+	MPLCONFIGDIR="$(CURDIR)/.matplotlib" PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(FT_TRANSFORMER_NO_LAT_LON_SCRIPT)" --train-files "$(TRAIN_FILES)" > "$$log_file" 2>&1 & \
+	echo "Started no-lat/lon transformer embedding fine-tuning in background. PID=$$!"; \
+	echo "Log file: $$log_file"; \
+	echo "Output directory: $(FT_TRANSFORMER_NO_LAT_LON_OUTPUT_DIR)"
 
 ft-forecast:
 	@mkdir -p "$(LOG_DIR)"
