@@ -216,21 +216,23 @@ def predict_global_cloud_probabilities(
     w_patches = int(w_grid // patch_size)
     patch_count = int(h_patches * w_patches)
     latent_levels = int(local_aurora_model.encoder.latent_levels)
+    encoder_leading_dim = int(enc_out.shape[0])
     embed_dim = int(enc_out.shape[-1])
     expected_embedding_dim = int(ckpt["input_dim"]) - len(emb_train.BASE_FEATURE_COLUMNS)
 
-    if latent_levels * embed_dim != expected_embedding_dim:
+    actual_embedding_dim = encoder_leading_dim * latent_levels * embed_dim
+    if actual_embedding_dim != expected_embedding_dim:
         raise ValueError(
             "Checkpoint input dimension does not match Aurora encoder output: "
-            f"latent_levels={latent_levels}, embed_dim={embed_dim}, "
-            f"latent_levels*embed_dim={latent_levels * embed_dim}, "
+            f"encoder_leading_dim={encoder_leading_dim}, latent_levels={latent_levels}, "
+            f"embed_dim={embed_dim}, actual_embedding_dim={actual_embedding_dim}, "
             f"expected_embedding_dim={expected_embedding_dim}"
         )
 
     token_device = device if tokens_on_device else "cpu"
     level_tokens = (
-        enc_out.detach()[0, : latent_levels * patch_count, :]
-        .reshape(latent_levels, patch_count, embed_dim)
+        enc_out.detach()[:, : latent_levels * patch_count, :]
+        .reshape(encoder_leading_dim, latent_levels, patch_count, embed_dim)
         .to(token_device, dtype=torch.float32)
     )
 
@@ -246,7 +248,8 @@ def predict_global_cloud_probabilities(
     print(
         "Global inference grid: "
         f"lat={len(lat)}, lon={len(lon)}, patch_size={patch_size}, "
-        f"patches={h_patches}x{w_patches}, input_dim={model_input_dim}"
+        f"patches={h_patches}x{w_patches}, encoder_leading_dim={encoder_leading_dim}, "
+        f"input_dim={model_input_dim}"
     )
     print(f"Scoring {len(lat) * len(lon):,} grid points in batches of {batch_size}")
 
@@ -268,7 +271,11 @@ def predict_global_cloud_probabilities(
             for start in range(0, n_rows, batch_size):
                 stop = min(n_rows, start + batch_size)
                 patch_idx_t = torch.from_numpy(patch_idx[start:stop]).to(token_device)
-                emb = level_tokens[:, patch_idx_t, :].permute(1, 0, 2).reshape(stop - start, -1)
+                emb = (
+                    level_tokens[:, :, patch_idx_t, :]
+                    .permute(2, 0, 1, 3)
+                    .reshape(stop - start, -1)
+                )
                 emb = emb.to(device)
 
                 base_np = np.column_stack(
@@ -307,6 +314,7 @@ def predict_global_cloud_probabilities(
         "base_longitude_convention": base_lon_convention,
         "reduction": "max over 40 transformer output levels",
         "aurora_patch_size": patch_size,
+        "aurora_encoder_leading_dim": encoder_leading_dim,
         "aurora_latent_levels": latent_levels,
         "aurora_embed_dim": embed_dim,
         "aurora_cropped_grid": "true",
