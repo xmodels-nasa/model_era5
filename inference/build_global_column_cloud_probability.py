@@ -153,6 +153,13 @@ def base_longitudes(lon: np.ndarray, convention: str) -> np.ndarray:
     raise ValueError(f"Unknown longitude convention: {convention}")
 
 
+def checkpoint_base_features(ckpt: Dict[str, object]) -> List[str]:
+    raw_features = ckpt.get("base_features", emb_train.BASE_FEATURE_COLUMNS)
+    if not isinstance(raw_features, (list, tuple)) or not all(isinstance(name, str) for name in raw_features):
+        raise ValueError("Checkpoint base_features must be a list of feature names.")
+    return list(raw_features)
+
+
 def load_transformer(model_dir: Path, device: str) -> Tuple[EmbeddingTransformerClassifier, np.ndarray, np.ndarray, Dict[str, object]]:
     model_path = model_dir / "multilabel_transformer.pt"
     stats_path = model_dir / "feature_stats.npz"
@@ -163,6 +170,11 @@ def load_transformer(model_dir: Path, device: str) -> Tuple[EmbeddingTransformer
 
     ckpt = torch_load(model_path, device)
     stats = np.load(stats_path)
+    base_features = checkpoint_base_features(ckpt)
+    # The classifier derives its base-token width from this shared schema.
+    # Set it from the checkpoint so a no-lat/lon model can be loaded without
+    # changing the original v2 training implementation.
+    emb_train.BASE_FEATURE_COLUMNS = list(base_features)
     model = EmbeddingTransformerClassifier(
         input_dim=int(ckpt["input_dim"]),
         output_dim=int(ckpt.get("output_dim", len(emb_train.TARGET_COLUMNS))),
@@ -188,6 +200,7 @@ def predict_global_cloud_probabilities(
     aurora_backbone: str,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, object]]:
     model, x_mean, x_std, ckpt = load_transformer(model_dir, device)
+    base_features = checkpoint_base_features(ckpt)
     x_mean_t = torch.from_numpy(x_mean).to(device)
     x_std_t = torch.from_numpy(x_std).to(device)
 
@@ -218,7 +231,7 @@ def predict_global_cloud_probabilities(
     latent_levels = int(local_aurora_model.encoder.latent_levels)
     encoder_leading_dim = int(enc_out.shape[0])
     embed_dim = int(enc_out.shape[-1])
-    expected_embedding_dim = int(ckpt["input_dim"]) - len(emb_train.BASE_FEATURE_COLUMNS)
+    expected_embedding_dim = int(ckpt["input_dim"]) - len(base_features)
 
     actual_embedding_dim = encoder_leading_dim * latent_levels * embed_dim
     if actual_embedding_dim != expected_embedding_dim:
@@ -278,16 +291,18 @@ def predict_global_cloud_probabilities(
                 )
                 emb = emb.to(device)
 
-                base_np = np.column_stack(
-                    [
-                        lat_flat[start:stop],
-                        lon_base_flat[start:stop],
-                        np.full(stop - start, day_sin, dtype=np.float32),
-                        np.full(stop - start, day_cos, dtype=np.float32),
-                        np.full(stop - start, year_sin, dtype=np.float32),
-                        np.full(stop - start, year_cos, dtype=np.float32),
-                    ]
-                ).astype(np.float32, copy=False)
+                base_values = {
+                    "Latitude_0": lat_flat[start:stop],
+                    "Longitude_0": lon_base_flat[start:stop],
+                    "time_day_sin": np.full(stop - start, day_sin, dtype=np.float32),
+                    "time_day_cos": np.full(stop - start, day_cos, dtype=np.float32),
+                    "time_year_sin": np.full(stop - start, year_sin, dtype=np.float32),
+                    "time_year_cos": np.full(stop - start, year_cos, dtype=np.float32),
+                }
+                unsupported = [name for name in base_features if name not in base_values]
+                if unsupported:
+                    raise ValueError(f"Global inference cannot construct checkpoint base features: {unsupported}")
+                base_np = np.column_stack([base_values[name] for name in base_features]).astype(np.float32, copy=False)
                 base_t = torch.from_numpy(base_np).to(device)
                 x = torch.cat([base_t, emb], dim=1)
                 if x.shape[1] != model_input_dim:
@@ -310,7 +325,7 @@ def predict_global_cloud_probabilities(
         "model_dir": str(model_dir),
         "model_architecture": str(ckpt.get("architecture", "embedding_transformer_classifier")),
         "model_input_dim": model_input_dim,
-        "base_features": json.dumps(list(ckpt.get("base_features", emb_train.BASE_FEATURE_COLUMNS))),
+        "base_features": json.dumps(base_features),
         "base_longitude_convention": base_lon_convention,
         "reduction": "max over 40 transformer output levels",
         "aurora_patch_size": patch_size,
