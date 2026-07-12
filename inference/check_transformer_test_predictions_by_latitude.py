@@ -33,6 +33,43 @@ LATITUDE_BANDS = [(-90, -60), (-60, -30), (-30, 0), (0, 30), (30, 60), (60, 90)]
 LONGITUDE_BANDS = [(-180, 0), (0, 180)]
 
 
+def _new_metrics() -> Dict[str, float]:
+    return {
+        "sample_count": 0.0,
+        "truth_sum": 0.0,
+        "prediction_sum": 0.0,
+        "brier_sum": 0.0,
+        "positive_prediction_count": 0.0,
+    }
+
+
+def _summary_row(
+    lat_low: int,
+    lat_high: int,
+    lon_low: int,
+    lon_high: int,
+    values: Dict[str, float],
+    threshold: float,
+    day_utc: str | None = None,
+) -> Dict[str, object]:
+    count = int(values["sample_count"])
+    row: Dict[str, object] = {
+        "lat_min": lat_low,
+        "lat_max": lat_high,
+        "lon_min": lon_low,
+        "lon_max": lon_high,
+        "sample_count": count,
+        "observed_column_cloud_fraction": values["truth_sum"] / count if count else None,
+        "mean_predicted_column_probability": values["prediction_sum"] / count if count else None,
+        "predicted_cloud_fraction_at_threshold": values["positive_prediction_count"] / count if count else None,
+        "column_brier_score": values["brier_sum"] / count if count else None,
+        "threshold": threshold,
+    }
+    if day_utc is not None:
+        row["day_utc"] = day_utc
+    return row
+
+
 def _resolve_feather_path(value: str, feather_root: Path | None) -> Path:
     path = Path(value)
     if path.is_file():
@@ -112,16 +149,11 @@ def main() -> int:
     x_std_t = torch.from_numpy(x_std).to(device)
 
     totals: Dict[tuple[int, int, int, int], Dict[str, float]] = {
-        (*lat_band, *lon_band): {
-            "sample_count": 0.0,
-            "truth_sum": 0.0,
-            "prediction_sum": 0.0,
-            "brier_sum": 0.0,
-            "positive_prediction_count": 0.0,
-        }
+        (*lat_band, *lon_band): _new_metrics()
         for lat_band in LATITUDE_BANDS
         for lon_band in LONGITUDE_BANDS
     }
+    daily_totals: Dict[str, Dict[tuple[int, int, int, int], Dict[str, float]]] = {}
     files_processed: List[Dict[str, object]] = []
     for file_index, meta in enumerate(metas):
         x, y, _ = emb_train._load_one_file_arrays(
@@ -143,6 +175,13 @@ def main() -> int:
 
         lat = x[:, latitude_index]
         lon = x[:, longitude_index]
+        file_time = pd.Timestamp(meta.file_time)
+        if file_time.tzinfo is None:
+            file_time = file_time.tz_localize("UTC")
+        else:
+            file_time = file_time.tz_convert("UTC")
+        day_utc = file_time.strftime("%Y-%m-%d")
+        day_metrics = daily_totals.setdefault(day_utc, {})
         for (lat_low, lat_high, lon_low, lon_high), values in totals.items():
             lon_upper = lon <= lon_high if lon_high == 180 else lon < lon_high
             mask = (lat >= lat_low) & (lat < lat_high) & (lon >= lon_low) & lon_upper
@@ -150,36 +189,31 @@ def main() -> int:
                 continue
             selected_truth = truth[mask]
             selected_prob = column_prob[mask]
-            values["sample_count"] += int(mask.sum())
-            values["truth_sum"] += float(selected_truth.sum())
-            values["prediction_sum"] += float(selected_prob.sum())
-            values["brier_sum"] += float(np.square(selected_prob - selected_truth).sum())
-            values["positive_prediction_count"] += int((selected_prob >= threshold).sum())
+            region = (lat_low, lat_high, lon_low, lon_high)
+            daily_values = day_metrics.setdefault(region, _new_metrics())
+            for metrics in (values, daily_values):
+                metrics["sample_count"] += int(mask.sum())
+                metrics["truth_sum"] += float(selected_truth.sum())
+                metrics["prediction_sum"] += float(selected_prob.sum())
+                metrics["brier_sum"] += float(np.square(selected_prob - selected_truth).sum())
+                metrics["positive_prediction_count"] += int((selected_prob >= threshold).sum())
         files_processed.append({"embedding_file": str(meta.npz_path), "sample_count": int(len(truth))})
         print(f"Processed {file_index + 1}/{len(metas)}: {meta.npz_path.name} ({len(truth):,} samples)")
 
     rows: List[Dict[str, object]] = []
     for (lat_low, lat_high, lon_low, lon_high), values in totals.items():
-        count = int(values["sample_count"])
-        rows.append(
-            {
-                "lat_min": lat_low,
-                "lat_max": lat_high,
-                "lon_min": lon_low,
-                "lon_max": lon_high,
-                "sample_count": count,
-                "observed_column_cloud_fraction": values["truth_sum"] / count if count else None,
-                "mean_predicted_column_probability": values["prediction_sum"] / count if count else None,
-                "predicted_cloud_fraction_at_threshold": values["positive_prediction_count"] / count if count else None,
-                "column_brier_score": values["brier_sum"] / count if count else None,
-                "threshold": threshold,
-            }
-        )
+        rows.append(_summary_row(lat_low, lat_high, lon_low, lon_high, values, threshold))
+    daily_rows: List[Dict[str, object]] = []
+    for day_utc, regions in sorted(daily_totals.items()):
+        for (lat_low, lat_high, lon_low, lon_high), values in regions.items():
+            daily_rows.append(_summary_row(lat_low, lat_high, lon_low, lon_high, values, threshold, day_utc))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.output_dir / "test_prediction_by_latitude_longitude.csv"
+    daily_csv_path = args.output_dir / "daily_prediction_by_latitude_longitude.csv"
     summary_path = args.output_dir / "summary.json"
     pd.DataFrame(rows).to_csv(csv_path, index=False)
+    pd.DataFrame(daily_rows).to_csv(daily_csv_path, index=False)
     summary = {
         "model_dir": str(args.model_dir),
         "split_path": str(args.split_path),
@@ -189,10 +223,13 @@ def main() -> int:
         "test_files_selected": len(metas),
         "files_processed": files_processed,
         "latitude_longitude_summary_csv": str(csv_path),
+        "daily_latitude_longitude_summary_csv": str(daily_csv_path),
     }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(pd.DataFrame(rows).to_string(index=False))
     print(f"Saved: {csv_path}")
+    print(pd.DataFrame(daily_rows).to_string(index=False))
+    print(f"Saved daily regional summary: {daily_csv_path}")
     return 0
 
 
