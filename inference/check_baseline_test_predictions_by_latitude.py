@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure baseline raw-chip calibration by latitude on held-out test tracks."""
+"""Measure baseline raw-chip calibration by latitude/longitude on test tracks."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from build_global_column_cloud_probability import resolve_device  # noqa: E402
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "results-v2" / "baseline_model_outputs"
 DEFAULT_OUTPUT_DIR = THIS_DIR / "outputs" / "baseline_test_latitude_check"
 LATITUDE_BANDS = [(-90, -60), (-60, -30), (-30, 0), (0, 30), (30, 60), (60, 90)]
+LONGITUDE_BANDS = [(-180, 0), (0, 180)]
 
 
 def _resolve_npz_path(value: str, raw_chip_dir: Path) -> Path:
@@ -92,9 +93,16 @@ def main() -> int:
     metas = _load_test_metas(args.split_path, args.raw_chip_dir, args.max_files)
     use_base_features = bool(checkpoint.get("base_features", raw_train.BASE_FEATURE_COLUMNS))
 
-    totals: Dict[tuple[int, int], Dict[str, float]] = {
-        band: {"sample_count": 0.0, "truth_sum": 0.0, "prediction_sum": 0.0, "brier_sum": 0.0, "positive_prediction_count": 0.0}
-        for band in LATITUDE_BANDS
+    totals: Dict[tuple[int, int, int, int], Dict[str, float]] = {
+        (*lat_band, *lon_band): {
+            "sample_count": 0.0,
+            "truth_sum": 0.0,
+            "prediction_sum": 0.0,
+            "brier_sum": 0.0,
+            "positive_prediction_count": 0.0,
+        }
+        for lat_band in LATITUDE_BANDS
+        for lon_band in LONGITUDE_BANDS
     }
     files_processed: List[Dict[str, object]] = []
     for file_index, meta in enumerate(metas):
@@ -123,9 +131,10 @@ def main() -> int:
             column_prob[start:stop] = probs.max(dim=1).values.detach().cpu().numpy()
 
         lat = payload["base_features"][:, 0]
-        for band, values in totals.items():
-            low, high = band
-            mask = (lat >= low) & (lat < high)
+        lon = payload["base_features"][:, 1]
+        for (lat_low, lat_high, lon_low, lon_high), values in totals.items():
+            lon_upper = lon <= lon_high if lon_high == 180 else lon < lon_high
+            mask = (lat >= lat_low) & (lat < lat_high) & (lon >= lon_low) & lon_upper
             if not mask.any():
                 continue
             selected_truth = truth[mask]
@@ -139,12 +148,14 @@ def main() -> int:
         print(f"Processed {file_index + 1}/{len(metas)}: {meta.npz_path.name} ({len(truth):,} samples)")
 
     rows: List[Dict[str, object]] = []
-    for (low, high), values in totals.items():
+    for (lat_low, lat_high, lon_low, lon_high), values in totals.items():
         count = int(values["sample_count"])
         rows.append(
             {
-                "lat_min": low,
-                "lat_max": high,
+                "lat_min": lat_low,
+                "lat_max": lat_high,
+                "lon_min": lon_low,
+                "lon_max": lon_high,
                 "sample_count": count,
                 "observed_column_cloud_fraction": values["truth_sum"] / count if count else None,
                 "mean_predicted_column_probability": values["prediction_sum"] / count if count else None,
