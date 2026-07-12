@@ -40,12 +40,7 @@ for path in (FINE_TUNED_DIR, PROJECT_ROOT):
         sys.path.insert(0, str(path))
 
 import train_multilabel_from_feather_embeddings as emb_train  # noqa: E402
-from build_aurora_batches import (  # noqa: E402
-    folder_name,
-    get_encoder_context_for_target,
-    load_aurora_model,
-    parse_target,
-)
+import build_aurora_batches as aurora_batches  # noqa: E402
 from train_multilabel_from_feather_embeddings_transformer import (  # noqa: E402
     EmbeddingTransformerClassifier,
 )
@@ -90,8 +85,8 @@ def target_string(dt: datetime) -> str:
 
 
 def has_era5_pair(data_root: Path, target_dt: datetime) -> bool:
-    return (data_root / folder_name(target_dt - timedelta(hours=6))).is_dir() and (
-        data_root / folder_name(target_dt)
+    return (data_root / aurora_batches.folder_name(target_dt - timedelta(hours=6))).is_dir() and (
+        data_root / aurora_batches.folder_name(target_dt)
     ).is_dir()
 
 
@@ -190,13 +185,21 @@ def predict_global_cloud_probabilities(
     row_chunk_size: int,
     base_lon_convention: str,
     tokens_on_device: bool,
+    aurora_backbone: str,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, object]]:
     model, x_mean, x_std, ckpt = load_transformer(model_dir, device)
     x_mean_t = torch.from_numpy(x_mean).to(device)
     x_std_t = torch.from_numpy(x_std).to(device)
 
-    aurora_model = load_aurora_model(device=aurora_device)
-    context = get_encoder_context_for_target(
+    if aurora_backbone == "full":
+        aurora_batches.DEBUG = False
+    elif aurora_backbone == "small":
+        aurora_batches.DEBUG = True
+    else:
+        raise ValueError(f"Unknown aurora_backbone={aurora_backbone!r}")
+
+    aurora_model = aurora_batches.load_aurora_model(device=aurora_device)
+    context = aurora_batches.get_encoder_context_for_target(
         data_root=str(data_root),
         target=target_string(target_dt),
         model=aurora_model,
@@ -382,6 +385,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--row-chunk-size", type=int, default=8)
     parser.add_argument("--base-lon-convention", choices=["minus180_180", "era5"], default="minus180_180")
     parser.add_argument(
+        "--aurora-backbone",
+        choices=["full", "small"],
+        default="full",
+        help="Aurora backbone used to build embeddings. The saved transformer expects full Aurora by default.",
+    )
+    parser.add_argument(
         "--tokens-on-device",
         action="store_true",
         help="Keep the full Aurora token tensor on the classifier device. Faster, but uses much more device memory.",
@@ -397,11 +406,12 @@ def main() -> int:
     selected_row: Optional[Dict[str, str]] = None
     available_candidate_count: Optional[int] = None
     if args.target:
-        target_dt = parse_target(args.target)
+        target_dt = aurora_batches.parse_target(args.target)
         if not has_era5_pair(args.data_root, target_dt):
             raise FileNotFoundError(
                 f"Target {args.target} is missing required ERA5 pair: "
-                f"{folder_name(target_dt - timedelta(hours=6))} and/or {folder_name(target_dt)}"
+                f"{aurora_batches.folder_name(target_dt - timedelta(hours=6))} "
+                f"and/or {aurora_batches.folder_name(target_dt)}"
             )
     else:
         target_dt, selected_row, available_candidate_count = select_test_target(
@@ -427,6 +437,7 @@ def main() -> int:
         row_chunk_size=args.row_chunk_size,
         base_lon_convention=args.base_lon_convention,
         tokens_on_device=args.tokens_on_device,
+        aurora_backbone=args.aurora_backbone,
     )
     save_dataset(
         output_path=output_path,
