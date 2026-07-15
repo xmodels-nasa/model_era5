@@ -133,8 +133,8 @@ def write_manifest(
             )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(description: str = __doc__) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--data-root", type=Path, default=default_data_root())
     parser.add_argument("--model-dir", type=Path, default=global_infer.DEFAULT_MODEL_DIR)
     parser.add_argument("--split-path", type=Path, default=global_infer.DEFAULT_MODEL_DIR / "file_split.csv")
@@ -160,11 +160,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--make-globe", action="store_true", help="Also write a globe PNG for each target.")
     parser.add_argument("--globe-center-lon", type=float, default=-90.0)
     parser.add_argument("--globe-center-lat", type=float, default=-20.0)
-    return parser.parse_args()
+    return parser
 
 
-def main() -> int:
-    args = parse_args()
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
+
+
+def run(args: argparse.Namespace) -> int:
     data_root = args.data_root.expanduser()
     output_dir = args.output_dir.expanduser()
     netcdf_dir = output_dir / "netcdf"
@@ -201,13 +204,13 @@ def main() -> int:
     print(f"Unavailable split rows in window: {len(unavailable)}")
     print(f"Manifest: {manifest_path}")
 
-    if not targets:
-        raise ValueError("No available target hours found for the requested split/window.")
-
     if args.list_only:
         for target_dt in targets:
             print(global_infer.target_string(target_dt))
         return 0
+
+    if not targets:
+        raise ValueError("No available target hours found for the requested split/window.")
 
     device = global_infer.resolve_device(args.device)
     aurora_device = global_infer.resolve_device(args.aurora_device or args.device)
@@ -276,6 +279,10 @@ def main() -> int:
             print(f"Saved globe PNG: {globe_png_path}")
 
     return 0
+
+
+def main() -> int:
+    return run(parse_args())
 
 
 if __name__ == "__main__":

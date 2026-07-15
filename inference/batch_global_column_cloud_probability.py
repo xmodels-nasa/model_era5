@@ -99,8 +99,8 @@ def filter_targets(
     return filtered
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(description: str = __doc__) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--data-root", type=Path, default=default_data_root())
     parser.add_argument("--model-dir", type=Path, default=global_infer.DEFAULT_MODEL_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -123,11 +123,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--make-globe", action="store_true", help="Also write a globe PNG for each target.")
     parser.add_argument("--globe-center-lon", type=float, default=-90.0)
     parser.add_argument("--globe-center-lat", type=float, default=-20.0)
-    return parser.parse_args()
+    return parser
 
 
-def main() -> int:
-    args = parse_args()
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
+
+
+def run(args: argparse.Namespace) -> int:
     data_root = args.data_root.expanduser()
     output_dir = args.output_dir.expanduser()
     netcdf_dir = output_dir / "netcdf"
@@ -224,6 +227,10 @@ def main() -> int:
             print(f"Saved globe PNG: {globe_png_path}")
 
     return 0
+
+
+def main() -> int:
+    return run(parse_args())
 
 
 if __name__ == "__main__":
