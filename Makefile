@@ -18,7 +18,7 @@ BASELINE_TRAIN_FORECAST_SCRIPT := baseline_model/train_multilabel_from_raw_chips
 BASELINE_AURORA_TRAIN_SCRIPT := baseline_model/train_multilable_from_rawchips_aurora_architecturer.py
 BASELINE_AURORA_TRAIN_FORECAST_SCRIPT := baseline_model/train_multilable_from_rawchips_aurora_architecturer_forecast.py
 LOG_DIR := logs
-TRAIN_FILES := 200
+TRAIN_FILES := 1000
 
 run: ft
 
