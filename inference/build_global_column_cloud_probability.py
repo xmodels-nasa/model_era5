@@ -145,6 +145,19 @@ def cyclic_time_features(target_dt: datetime) -> Tuple[float, float, float, floa
     )
 
 
+def local_solar_time_features(target_dt: datetime, lon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    dt = target_dt.replace(tzinfo=timezone.utc)
+    utc_hour = (
+        dt.hour
+        + dt.minute / 60.0
+        + dt.second / 3600.0
+        + dt.microsecond / 3_600_000_000.0
+    )
+    local_hour = np.mod(utc_hour + lon.astype(np.float64) / 15.0, 24.0)
+    phase = 2.0 * math.pi * local_hour / 24.0
+    return np.sin(phase).astype(np.float32), np.cos(phase).astype(np.float32)
+
+
 def base_longitudes(lon: np.ndarray, convention: str) -> np.ndarray:
     if convention == "era5":
         return lon.astype(np.float32, copy=False)
@@ -255,6 +268,7 @@ def predict_global_cloud_probabilities(
 
     day_sin, day_cos, year_sin, year_cos = cyclic_time_features(target_dt)
     lon_base = base_longitudes(lon, base_lon_convention)
+    local_solar_sin, local_solar_cos = local_solar_time_features(target_dt, lon_base)
     output_levels = np.empty((len(emb_train.TARGET_COLUMNS), len(lat), len(lon)), dtype=np.float32)
 
     model_input_dim = int(ckpt["input_dim"])
@@ -278,6 +292,8 @@ def predict_global_cloud_probabilities(
             ).reshape(-1)
             lat_flat = np.repeat(lat[row_start:row_stop], len(lon))
             lon_base_flat = np.tile(lon_base, row_stop - row_start)
+            local_solar_sin_flat = np.tile(local_solar_sin, row_stop - row_start)
+            local_solar_cos_flat = np.tile(local_solar_cos, row_stop - row_start)
             n_rows = patch_idx.shape[0]
             chunk_probs = np.empty((n_rows, len(emb_train.TARGET_COLUMNS)), dtype=np.float32)
 
@@ -298,6 +314,8 @@ def predict_global_cloud_probabilities(
                     "time_day_cos": np.full(stop - start, day_cos, dtype=np.float32),
                     "time_year_sin": np.full(stop - start, year_sin, dtype=np.float32),
                     "time_year_cos": np.full(stop - start, year_cos, dtype=np.float32),
+                    "local_solar_time_sin": local_solar_sin_flat[start:stop],
+                    "local_solar_time_cos": local_solar_cos_flat[start:stop],
                 }
                 unsupported = [name for name in base_features if name not in base_values]
                 if unsupported:
