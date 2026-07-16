@@ -21,6 +21,8 @@ BASELINE_AURORA_TRAIN_SCRIPT := baseline_model/train_multilable_from_rawchips_au
 BASELINE_AURORA_TRAIN_FORECAST_SCRIPT := baseline_model/train_multilable_from_rawchips_aurora_architecturer_forecast.py
 LOG_DIR := logs
 TRAIN_FILES := 1000
+LOCAL_SOLAR_TIME_TRAIN_FILES := 3000
+LOCAL_SOLAR_TIME_SAMPLE_RATIO := 0.2
 
 run: ft
 
@@ -62,9 +64,11 @@ ft-transformer-local-solar-time:
 	@mkdir -p "$(LOG_DIR)" ".matplotlib" "$(FT_TRANSFORMER_LOCAL_SOLAR_TIME_OUTPUT_DIR)"
 	@timestamp="$$(date +"%Y%m%d_%H%M%S")"; \
 	log_file="$(LOG_DIR)/train_multilabel_from_feather_embeddings_transformer_local_solar_time_$${timestamp}.log"; \
-	MPLCONFIGDIR="$(CURDIR)/.matplotlib" PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(FT_TRANSFORMER_LOCAL_SOLAR_TIME_SCRIPT)" --train-files "$(TRAIN_FILES)" > "$$log_file" 2>&1 & \
+	MPLCONFIGDIR="$(CURDIR)/.matplotlib" PYTHONUNBUFFERED=1 nohup .venv/bin/python -u "$(FT_TRANSFORMER_LOCAL_SOLAR_TIME_SCRIPT)" --train-files "$(LOCAL_SOLAR_TIME_TRAIN_FILES)" --sample-ratio "$(LOCAL_SOLAR_TIME_SAMPLE_RATIO)" > "$$log_file" 2>&1 & \
 	echo "Started local-solar-time transformer embedding fine-tuning in background. PID=$$!"; \
 	echo "Log file: $$log_file"; \
+	echo "Train files: $(LOCAL_SOLAR_TIME_TRAIN_FILES)"; \
+	echo "Sample ratio: $(LOCAL_SOLAR_TIME_SAMPLE_RATIO)"; \
 	echo "Output directory: $(FT_TRANSFORMER_LOCAL_SOLAR_TIME_OUTPUT_DIR)"
 
 ft-forecast:
