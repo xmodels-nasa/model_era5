@@ -71,6 +71,7 @@ def plot_curtains(
         timestamp = ds["timestamp_utc"].values
         threshold = float(ds.attrs.get("threshold", 0.5))
         source_file_count = int(ds.attrs.get("source_file_count", len(np.unique(file_index))))
+        split_selection = str(ds.attrs.get("split_selection", ds.attrs.get("split", "unknown")))
 
     sample_idx = ordered_sample_indices(file_index, samples_per_file)
     if sample_idx.size == 0:
@@ -125,6 +126,7 @@ def plot_curtains(
     fig.suptitle(
         "CloudSat track cloud mask curtains\n"
         f"{start_time} to {end_time} UTC | files={source_file_count} | "
+        f"split={split_selection} | "
         f"lat {latitude[sample_idx].min():.1f}..{latitude[sample_idx].max():.1f}, "
         f"lon {longitude[sample_idx].min():.1f}..{longitude[sample_idx].max():.1f}",
         fontsize=12,

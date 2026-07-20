@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Predict 40-level cloud probabilities along July CloudSat test tracks.
+"""Predict 40-level cloud probabilities along July CloudSat tracks.
 
 This script uses saved track embedding NPZ files, not global-grid Aurora
-embeddings. It reads the model split manifest, selects July test files, predicts
+embeddings. It reads the model split manifest, selects July files, predicts
 all valid embedding rows along those tracks, and writes labels/probabilities to
 a NetCDF file.
 """
@@ -114,9 +114,11 @@ def selected_split_rows(
     if not split_path.is_file():
         raise FileNotFoundError(f"Missing split manifest: {split_path}")
     rows: List[Dict[str, str]] = []
+    split_filter = split.strip().lower()
+    include_all_splits = split_filter in {"", "all", "*"}
     with split_path.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
-            if row.get("split") != split:
+            if not include_all_splits and row.get("split") != split:
                 continue
             file_time = pd.Timestamp(row["file_time_utc"])
             if file_time.tzinfo is None:
@@ -126,7 +128,8 @@ def selected_split_rows(
             if start <= file_time <= end:
                 rows.append(row)
     if not rows:
-        raise ValueError(f"No split={split!r} files found in {split_path} for {start} through {end}.")
+        split_note = "any split" if include_all_splits else f"split={split!r}"
+        raise ValueError(f"No {split_note} files found in {split_path} for {start} through {end}.")
     return rows
 
 
@@ -237,7 +240,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--split-path", type=Path, default=None)
-    parser.add_argument("--split", default="test")
+    parser.add_argument("--split", default="all", help="Split to include. Use 'all' to include every July row.")
     parser.add_argument(
         "--embedding-dir",
         type=Path,
@@ -248,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--month", type=int, default=7)
     parser.add_argument("--start", default=None, help="Optional UTC start timestamp, e.g. 2019_07_01_00.")
     parser.add_argument("--end", default=None, help="Optional UTC end timestamp, e.g. 2019_07_10_23.")
-    parser.add_argument("--max-files", type=int, default=0, help="0 means all selected split files.")
+    parser.add_argument("--max-files", type=int, default=0, help="0 means all selected July files.")
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--device", default="auto")
@@ -379,7 +382,7 @@ def main() -> int:
         attrs={
             "model_dir": str(args.model_dir),
             "split_path": str(split_path),
-            "split": args.split,
+            "split_selection": args.split,
             "embedding_dir": str(args.embedding_dir),
             "feather_root": str(args.feather_root or ""),
             "start_time_utc": str(start),
